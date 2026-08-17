@@ -149,7 +149,8 @@ with tab0:
     pasted_script = st.text_area(
         "Script (must use [SCENE N: prompt] markers, as written in chat)",
         st.session_state.get("script_text", ""), height=400)
-    if st.button("Save script", type="primary"):
+    col_a, col_b = st.columns(2)
+    if col_a.button("Save script", type="primary"):
         if "[SCENE" not in pasted_script:
             st.warning("No [SCENE N: ...] markers found — check you pasted the full script.")
         else:
@@ -160,9 +161,44 @@ with tab0:
             st.success(f"Saved — {scene_count} scenes, ~{word_count} words, "
                        f"~{word_count/135:.1f} min estimated.")
 
+    st.divider()
+    st.markdown("**Or run the whole thing in one click** (audio → align → images), using the settings below.")
+    voice_auto = st.selectbox("Voice", EDGE_TTS_VOICES, key="voice_auto")
+    kaggle_user_auto = st.text_input("Kaggle username (leave blank if set in Secrets)", key="ku_auto")
+    kaggle_key_auto = st.text_input("Kaggle API key (leave blank if set in Secrets)", type="password", key="kk_auto")
+    if col_b.button("Run full pipeline", type="primary"):
+        if "[SCENE" not in pasted_script:
+            st.warning("No [SCENE N: ...] markers found — check you pasted the full script.")
+        else:
+            st.session_state["script_text"] = pasted_script
+            try:
+                with st.spinner("Step 1/3 — generating audio..."):
+                    audio_path = generate_audio_file(pasted_script, voice_auto)
+                    st.session_state["audio_path"] = audio_path
+                st.success("Audio done.")
+
+                with st.spinner("Step 2/3 — aligning to get timestamps..."):
+                    manifest_path, n_scenes = align_script_to_audio_file(pasted_script, audio_path)
+                    st.session_state["manifest_path"] = manifest_path
+                st.success(f"Aligned {n_scenes} scenes.")
+
+                with st.spinner("Step 3/3 — generating images on Kaggle (this can take a while)..."):
+                    from kaggle_runner import run_image_generation_on_kaggle
+                    kaggle_user = get_secret("KAGGLE_USERNAME", kaggle_user_auto)
+                    kaggle_key = get_secret("KAGGLE_KEY", kaggle_key_auto)
+                    zip_path, log = run_image_generation_on_kaggle(manifest_path, kaggle_user, kaggle_key)
+                st.success(log)
+                with open(zip_path, "rb") as f:
+                    st.download_button("Download scene_images_batch.zip", f, file_name="scene_images_batch.zip")
+            except Exception as e:
+                st.error(f"Pipeline stopped at an error: {e}")
+                st.info("Whatever completed before the error is saved — check the individual tabs above to pick up from there.")
+
 with tab3:
     default_script = st.session_state.get("script_text", "")
-    script_for_audio = st.text_area("Script (auto-filled from Script tab, or paste your own)",
+    if default_script:
+        st.info("Using the script saved in step 1 automatically.")
+    script_for_audio = st.text_area("Script (auto-filled from step 1)",
                                      default_script, height=300, key="audio_script")
     voice = st.selectbox("Voice", EDGE_TTS_VOICES)
     if st.button("Generate audio", type="primary"):
@@ -178,8 +214,10 @@ with tab3:
 
 with tab4:
     default_script2 = st.session_state.get("script_text", "")
-    script_for_align = st.text_area("Script", default_script2, height=300, key="align_script")
-    uploaded_audio = st.file_uploader("Finished audio (mp3/wav)", type=["mp3", "wav"])
+    script_for_align = st.text_area("Script (auto-filled from step 1)", default_script2, height=300, key="align_script")
+    if "audio_path" in st.session_state:
+        st.info("Using the audio generated in step 2 automatically. Upload a different file below only if you want to override it.")
+    uploaded_audio = st.file_uploader("Finished audio (optional — auto-used from step 2 if you skip this)", type=["mp3", "wav"])
     if st.button("Generate scene manifest", type="primary"):
         if not uploaded_audio and "audio_path" not in st.session_state:
             st.warning("Upload an audio file, or generate one in the Audio tab first.")
@@ -201,19 +239,25 @@ with tab4:
                     st.error(f"Alignment failed: {e}")
 
 with tab5:
-    uploaded_manifest = st.file_uploader("scene_manifest.csv", type=["csv"])
+    has_saved_manifest = "manifest_path" in st.session_state
+    if has_saved_manifest:
+        st.info("Using the scene manifest from step 3 automatically. Upload a different one below only if you want to override it.")
+    uploaded_manifest = st.file_uploader("scene_manifest.csv (optional — auto-used from step 3 if you skip this)", type=["csv"])
     kaggle_user_override = st.text_input("Kaggle username (leave blank if set in Secrets)")
     kaggle_key_override = st.text_input("Kaggle API key (leave blank if set in Secrets)", type="password")
     if st.button("Generate images", type="primary"):
-        if not uploaded_manifest:
-            st.warning("Upload a scene_manifest.csv first (or use the one from the Align tab).")
+        if not uploaded_manifest and not has_saved_manifest:
+            st.warning("No manifest found — run step 3 (Align) first, or upload a scene_manifest.csv here.")
         else:
             with st.spinner("Running on Kaggle — this can take a while..."):
                 try:
                     from kaggle_runner import run_image_generation_on_kaggle
-                    manifest_path = os.path.join(tempfile.gettempdir(), "scene_manifest.csv")
-                    with open(manifest_path, "wb") as f:
-                        f.write(uploaded_manifest.read())
+                    if uploaded_manifest:
+                        manifest_path = os.path.join(tempfile.gettempdir(), "scene_manifest.csv")
+                        with open(manifest_path, "wb") as f:
+                            f.write(uploaded_manifest.read())
+                    else:
+                        manifest_path = st.session_state["manifest_path"]
                     kaggle_user = get_secret("KAGGLE_USERNAME", kaggle_user_override)
                     kaggle_key = get_secret("KAGGLE_KEY", kaggle_key_override)
                     zip_path, log = run_image_generation_on_kaggle(manifest_path, kaggle_user, kaggle_key)
