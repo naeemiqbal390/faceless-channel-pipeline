@@ -1,0 +1,249 @@
+"""
+kaggle_runner.py
+
+Handles talking to Kaggle's API on the user's behalf, split into CHUNKS so
+the app can show real, exact progress and genuinely resume after an
+interruption — rather than one opaque black-box run with no visibility.
+
+Why chunked: Kaggle's API doesn't reliably expose file-by-file progress
+from a kernel while it's still running, so a single big run can't report
+real live percentages. Running in chunks (e.g. 25 images at a time) means
+the app knows exactly how many chunks are done, and can resume from the
+next unfinished one — a real checkpoint, not a guess.
+
+Resume persistence: progress is saved to disk at
+/tmp/pipeline_runs/{run_id}/state.json plus each chunk's downloaded zip.
+This survives the browser closing/reopening within the same running app
+session. It does NOT survive a full app reboot/redeploy on Streamlit Cloud
+(that wipes disk) — for that level of safety, download each chunk's
+partial zip as it completes, so you always have a real backup on your own
+machine regardless of what happens to the server.
+"""
+
+import os
+import re
+import json
+import time
+import shutil
+import hashlib
+import tempfile
+import subprocess
+
+import pandas as pd
+
+
+RUNS_DIR = os.path.join(tempfile.gettempdir(), "pipeline_runs")
+
+KERNEL_SCRIPT_TEMPLATE = '''
+import subprocess, sys
+
+subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                 "diffusers", "accelerate", "transformers", "sentencepiece"],
+                check=True)
+
+import pandas as pd
+import torch
+from diffusers import FluxPipeline
+import os, shutil, traceback
+
+try:
+    df = pd.read_csv("/kaggle/input/{dataset_slug}/scene_manifest.csv")
+    OUTPUT_DIR = "/kaggle/working/scene_images"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print("Loading FLUX.1-schnell...")
+    pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16)
+    pipe.to("cuda")
+    print("Model loaded.")
+
+    def safe_time(t):
+        return str(t).replace(":", "-")
+
+    for _, row in df.iterrows():
+        scene_id = int(row["scene_id"])
+        fname = f"scene_{{scene_id:03d}}_{{safe_time(row['start_time'])}}_{{safe_time(row['end_time'])}}.png"
+        out_path = os.path.join(OUTPUT_DIR, fname)
+        if os.path.exists(out_path):
+            continue
+        image = pipe(prompt=row["prompt"], width=1024, height=576,
+                     num_inference_steps=4, guidance_scale=0.0).images[0]
+        image.save(out_path)
+        print(f"Saved {{fname}}")
+
+    shutil.make_archive("/kaggle/working/scene_images_batch", "zip", OUTPUT_DIR)
+    print("DONE")
+except Exception as e:
+    print("KERNEL_SCRIPT_ERROR:", str(e))
+    traceback.print_exc()
+    raise
+'''
+
+
+def _run_kaggle_cli(args, env):
+    result = subprocess.run(["kaggle"] + args, capture_output=True, text=True, env=env)
+    if result.returncode != 0:
+        raise RuntimeError(f"kaggle CLI failed: {result.stderr}")
+    return result.stdout
+
+
+def compute_run_id(manifest_path):
+    """A stable ID derived from the manifest's content, so resuming the
+    same video's manifest always finds the same saved progress."""
+    with open(manifest_path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:16]
+
+
+def _load_state(run_id):
+    state_path = os.path.join(RUNS_DIR, run_id, "state.json")
+    if os.path.exists(state_path):
+        with open(state_path) as f:
+            return json.load(f)
+    return {"completed_chunks": []}
+
+
+def _save_state(run_id, state):
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "state.json"), "w") as f:
+        json.dump(state, f)
+
+
+def get_resume_status(manifest_path, chunk_size=25):
+    """Check if there's existing progress for this exact manifest."""
+    run_id = compute_run_id(manifest_path)
+    df = pd.read_csv(manifest_path)
+    total_chunks = (len(df) + chunk_size - 1) // chunk_size
+    state = _load_state(run_id)
+    done = len(state.get("completed_chunks", []))
+    return {
+        "run_id": run_id,
+        "total_chunks": total_chunks,
+        "done_chunks": done,
+        "total_images": len(df),
+        "has_progress": done > 0,
+    }
+
+
+def _run_single_chunk(chunk_df, kaggle_username, kaggle_key, chunk_index, timeout_minutes=25):
+    env = os.environ.copy()
+    env["KAGGLE_USERNAME"] = kaggle_username
+    env["KAGGLE_KEY"] = kaggle_key
+
+    work_dir = tempfile.mkdtemp(prefix=f"kaggle_chunk_{chunk_index}_")
+    dataset_slug_name = f"chunk-{chunk_index}-{int(time.time())}"
+    dataset_slug = f"{kaggle_username}/{dataset_slug_name}"
+
+    dataset_dir = os.path.join(work_dir, "dataset")
+    os.makedirs(dataset_dir, exist_ok=True)
+    chunk_df.to_csv(os.path.join(dataset_dir, "scene_manifest.csv"), index=False)
+    with open(os.path.join(dataset_dir, "dataset-metadata.json"), "w") as f:
+        json.dump({"title": dataset_slug_name, "id": dataset_slug, "licenses": [{"name": "CC0-1.0"}]}, f)
+    _run_kaggle_cli(["datasets", "create", "-p", dataset_dir, "-q"], env)
+
+    kernel_dir = os.path.join(work_dir, "kernel")
+    os.makedirs(kernel_dir, exist_ok=True)
+    with open(os.path.join(kernel_dir, "generate.py"), "w") as f:
+        f.write(KERNEL_SCRIPT_TEMPLATE.format(dataset_slug=dataset_slug_name))
+    kernel_slug_name = f"image-gen-chunk-{chunk_index}-{int(time.time())}"
+    kernel_slug = f"{kaggle_username}/{kernel_slug_name}"
+    with open(os.path.join(kernel_dir, "kernel-metadata.json"), "w") as f:
+        json.dump({
+            "id": kernel_slug, "title": kernel_slug_name, "code_file": "generate.py",
+            "language": "python", "kernel_type": "script", "is_private": True,
+            "enable_gpu": True, "enable_internet": True, "dataset_sources": [dataset_slug],
+        }, f)
+    _run_kaggle_cli(["kernels", "push", "-p", kernel_dir], env)
+
+    deadline = time.time() + timeout_minutes * 60
+    status = "unknown"
+    last_status_text = ""
+    while time.time() < deadline:
+        time.sleep(20)
+        status_output = _run_kaggle_cli(["kernels", "status", kernel_slug], env)
+        last_status_text = status_output.strip()
+        lowered = last_status_text.lower()
+        if re.search(r"\berror\b|\bfailed\b|\bcancelled\b", lowered):
+            raise RuntimeError(
+                f"Chunk {chunk_index} crashed. Status: {last_status_text}\n"
+                f"Log: https://www.kaggle.com/code/{kernel_slug}")
+        if re.search(r"\bcomplete\b", lowered) and "incomplete" not in lowered:
+            status = "complete"
+            break
+
+    if status != "complete":
+        raise RuntimeError(f"Chunk {chunk_index} did not finish in {timeout_minutes} min. "
+                            f"Last status: '{last_status_text}'. Check: https://www.kaggle.com/code/{kernel_slug}")
+
+    output_dir = os.path.join(work_dir, "output")
+    os.makedirs(output_dir, exist_ok=True)
+    _run_kaggle_cli(["kernels", "output", kernel_slug, "-p", output_dir], env)
+
+    zip_path = os.path.join(output_dir, "scene_images_batch.zip")
+    if not os.path.exists(zip_path):
+        raise RuntimeError(f"Chunk {chunk_index} finished but produced no output zip.")
+    return zip_path
+
+
+def run_image_generation_chunked(manifest_path, kaggle_username, kaggle_key,
+                                   chunk_size=25, progress_callback=None):
+    """
+    Runs image generation in chunks, saving real progress to disk after
+    each one. Automatically resumes from the first incomplete chunk if
+    called again on the same manifest.
+
+    progress_callback(done_chunks, total_chunks, done_images, total_images, message)
+    is called after each chunk completes, for live UI updates.
+
+    Returns the path to the final combined zip of all images.
+    """
+    run_id = compute_run_id(manifest_path)
+    run_dir = os.path.join(RUNS_DIR, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+
+    df = pd.read_csv(manifest_path)
+    total_images = len(df)
+    chunks = [df.iloc[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
+    total_chunks = len(chunks)
+
+    state = _load_state(run_id)
+    completed = set(state.get("completed_chunks", []))
+
+    if progress_callback and completed:
+        progress_callback(len(completed), total_chunks,
+                           min(len(completed) * chunk_size, total_images), total_images,
+                           f"Resuming — {len(completed)}/{total_chunks} chunks already done.")
+
+    for i, chunk_df in enumerate(chunks):
+        if i in completed:
+            continue
+
+        chunk_zip = _run_single_chunk(chunk_df, kaggle_username, kaggle_key, i)
+
+        saved_chunk_path = os.path.join(run_dir, f"chunk_{i}.zip")
+        shutil.copy(chunk_zip, saved_chunk_path)
+
+        completed.add(i)
+        state["completed_chunks"] = sorted(completed)
+        _save_state(run_id, state)
+
+        done_images = min(len(completed) * chunk_size, total_images)
+        if progress_callback:
+            progress_callback(len(completed), total_chunks, done_images, total_images,
+                               f"Chunk {i+1}/{total_chunks} done.")
+
+    # Merge all chunk zips into one final zip
+    merged_dir = os.path.join(run_dir, "merged")
+    os.makedirs(merged_dir, exist_ok=True)
+    for i in range(total_chunks):
+        chunk_zip_path = os.path.join(run_dir, f"chunk_{i}.zip")
+        shutil.unpack_archive(chunk_zip_path, merged_dir, "zip")
+
+    final_zip = os.path.join(run_dir, "scene_images_batch_final")
+    shutil.make_archive(final_zip, "zip", merged_dir)
+    return final_zip + ".zip"
+
+
+def run_image_generation_on_kaggle(manifest_path, kaggle_username, kaggle_key, timeout_minutes=60):
+    """Kept for backward compatibility — single-shot version without chunking."""
+    zip_path = run_image_generation_chunked(manifest_path, kaggle_username, kaggle_key)
+    return zip_path, "Images generated successfully via Kaggle (chunked run)."
