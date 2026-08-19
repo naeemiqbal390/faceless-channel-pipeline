@@ -37,13 +37,34 @@ RUNS_DIR = os.path.join(tempfile.gettempdir(), "pipeline_runs")
 KERNEL_SCRIPT_TEMPLATE = '''
 import subprocess, sys
 
+def log(msg):
+    print(msg, flush=True)
+
+# Kaggle's default P100 GPU (compute capability sm_60) is not supported by
+# the newest pre-installed torch builds (sm_70+ only). Pin a P100-compatible
+# torch/torchvision build BEFORE torch is imported anywhere in this process,
+# so generation actually runs on GPU instead of crashing or silently
+# falling back to CPU.
+try:
+    import torch as _torch_probe
+    _cap = _torch_probe.cuda.get_device_capability(0) if _torch_probe.cuda.is_available() else None
+except Exception:
+    _cap = None
+
+if _cap is None or _cap[0] < 7:
+    log("Installing a GPU-compatible torch/torchvision build...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                     "torch==2.1.2", "torchvision==0.16.2",
+                     "--index-url", "https://download.pytorch.org/whl/cu118"],
+                    check=False)
+
 subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-                 "diffusers", "accelerate", "transformers", "sentencepiece"],
+                 "diffusers", "accelerate", "transformers"],
                 check=True)
 
 import pandas as pd
 import torch
-from diffusers import FluxPipeline
+from diffusers import StableDiffusionPipeline
 import os, shutil, traceback
 
 try:
@@ -51,10 +72,21 @@ try:
     OUTPUT_DIR = "/kaggle/working/scene_images"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    print("Loading FLUX.1-schnell...")
-    pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16)
-    pipe.to("cuda")
-    print("Model loaded.")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    log(f"Loading Stable Diffusion 1.5 on {{device}}...")
+    pipe = StableDiffusionPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5",
+        torch_dtype=dtype,
+        safety_checker=None,
+    )
+    pipe = pipe.to(device)
+    log("Model loaded.")
+
+    NEGATIVE_PROMPT = (
+        "photorealistic, photograph, 3d render, realistic skin, hyperrealism, "
+        "blurry, low quality, text, watermark, extra limbs, deformed"
+    )
 
     def safe_time(t):
         return str(t).replace(":", "-")
@@ -65,15 +97,19 @@ try:
         out_path = os.path.join(OUTPUT_DIR, fname)
         if os.path.exists(out_path):
             continue
-        image = pipe(prompt=row["prompt"], width=1024, height=576,
-                     num_inference_steps=4, guidance_scale=0.0).images[0]
+        image = pipe(
+            prompt=row["prompt"],
+            negative_prompt=NEGATIVE_PROMPT,
+            width=768, height=432,
+            num_inference_steps=25, guidance_scale=7.5,
+        ).images[0]
         image.save(out_path)
-        print(f"Saved {{fname}}")
+        log(f"Saved {{fname}}")
 
     shutil.make_archive("/kaggle/working/scene_images_batch", "zip", OUTPUT_DIR)
-    print("DONE")
+    log("DONE")
 except Exception as e:
-    print("KERNEL_SCRIPT_ERROR:", str(e))
+    log("KERNEL_SCRIPT_ERROR: " + str(e))
     traceback.print_exc()
     raise
 '''
@@ -124,29 +160,52 @@ def get_resume_status(manifest_path, chunk_size=25):
     }
 
 
-def _wait_for_dataset_ready(dataset_slug, env, timeout_seconds=120, poll_interval=5):
-    """
-    Kaggle dataset creation is asynchronous — 'kaggle datasets create'
-    returns before the dataset is actually ready to be referenced by a
-    kernel. Pushing a kernel too early results in an empty /kaggle/input
-    folder (FileNotFoundError inside the kernel) — this was the confirmed
-    root cause of a real failure seen in testing. This polls until the
-    dataset's actual file listing confirms scene_manifest.csv is present,
-    which is a stronger signal than just checking a status string.
-    """
-    deadline = time.time() + timeout_seconds
+def _wait_for_dataset_ready(dataset_slug, env, timeout_s=120, interval_s=5):
+    """Kaggle datasets aren't instantly queryable right after `datasets
+    create` returns — poll `kaggle datasets files` until the manifest is
+    actually visible before letting a kernel reference this dataset.
+    Skipping this step is what caused every earlier FileNotFoundError."""
+    deadline = time.time() + timeout_s
+    last_output = ""
     while time.time() < deadline:
         try:
-            output = _run_kaggle_cli(["datasets", "files", dataset_slug], env)
-            if "scene_manifest.csv" in output:
+            last_output = _run_kaggle_cli(["datasets", "files", dataset_slug], env)
+            if "scene_manifest.csv" in last_output:
                 return
-        except RuntimeError:
-            pass  # not indexed yet — expected briefly after creation, keep polling
-        time.sleep(poll_interval)
+        except Exception as e:
+            last_output = str(e)
+        time.sleep(interval_s)
     raise RuntimeError(
-        f"Dataset {dataset_slug} did not become ready within {timeout_seconds}s. "
-        f"Check https://www.kaggle.com/datasets/{dataset_slug} directly."
+        f"Dataset {dataset_slug} never became ready within {timeout_s}s.\n"
+        f"Last check: {last_output}"
     )
+
+
+def _fetch_kernel_log_tail(kernel_slug, env, max_chars=3000):
+    """Download whatever Kaggle produced for this kernel run and pull out
+    real log/error content, instead of leaving the user with just a status
+    string and a guessed URL."""
+    out_dir = tempfile.mkdtemp(prefix="kernel_fail_out_")
+    try:
+        _run_kaggle_cli(["kernels", "output", kernel_slug, "-p", out_dir], env)
+    except Exception as e:
+        return f"(could not download kernel output: {e})"
+
+    collected = ""
+    try:
+        for fn in sorted(os.listdir(out_dir)):
+            full = os.path.join(out_dir, fn)
+            if not os.path.isfile(full):
+                continue
+            if fn.endswith(".log") or "log" in fn.lower():
+                with open(full, "r", errors="ignore") as f:
+                    collected += f"--- {fn} ---\n" + f.read() + "\n"
+    except Exception:
+        pass
+
+    if not collected:
+        return f"(no log file found in kernel output; files present: {os.listdir(out_dir) if os.path.exists(out_dir) else '[]'})"
+    return collected[-max_chars:]
 
 
 def _run_single_chunk(chunk_df, kaggle_username, kaggle_key, chunk_index, timeout_minutes=25):
@@ -165,6 +224,8 @@ def _run_single_chunk(chunk_df, kaggle_username, kaggle_key, chunk_index, timeou
         json.dump({"title": dataset_slug_name, "id": dataset_slug, "licenses": [{"name": "CC0-1.0"}]}, f)
     _run_kaggle_cli(["datasets", "create", "-p", dataset_dir, "-q"], env)
 
+    # Don't push the kernel until Kaggle actually confirms the dataset file
+    # is there — this is the step that was missing before.
     _wait_for_dataset_ready(dataset_slug, env)
 
     kernel_dir = os.path.join(work_dir, "kernel")
@@ -190,16 +251,21 @@ def _run_single_chunk(chunk_df, kaggle_username, kaggle_key, chunk_index, timeou
         last_status_text = status_output.strip()
         lowered = last_status_text.lower()
         if re.search(r"\berror\b|\bfailed\b|\bcancelled\b", lowered):
+            log_tail = _fetch_kernel_log_tail(kernel_slug, env)
             raise RuntimeError(
                 f"Chunk {chunk_index} crashed. Status: {last_status_text}\n"
-                f"Log: https://www.kaggle.com/code/{kernel_slug}")
+                f"Kaggle page: https://www.kaggle.com/code/{kernel_slug}\n"
+                f"--- log tail ---\n{log_tail}")
         if re.search(r"\bcomplete\b", lowered) and "incomplete" not in lowered:
             status = "complete"
             break
 
     if status != "complete":
+        log_tail = _fetch_kernel_log_tail(kernel_slug, env)
         raise RuntimeError(f"Chunk {chunk_index} did not finish in {timeout_minutes} min. "
-                            f"Last status: '{last_status_text}'. Check: https://www.kaggle.com/code/{kernel_slug}")
+                            f"Last status: '{last_status_text}'.\n"
+                            f"Kaggle page: https://www.kaggle.com/code/{kernel_slug}\n"
+                            f"--- log tail ---\n{log_tail}")
 
     output_dir = os.path.join(work_dir, "output")
     os.makedirs(output_dir, exist_ok=True)
