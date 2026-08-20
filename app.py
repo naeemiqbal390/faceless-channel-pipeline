@@ -22,7 +22,7 @@ def force_fix_manifest_csv(csv_path):
     df = pd.read_csv(csv_path)
     
     # Clean whitespace, hidden characters, and lowercase everything
-    df.columns = df.columns.str.strip().str.replace('\ufeff', '').str.lower()
+    df.columns = df.columns.astype(str).str.strip().str.replace('\ufeff', '').str.lower()
     
     # Rename common variations to standard schema
     rename_dict = {}
@@ -37,7 +37,7 @@ def force_fix_manifest_csv(csv_path):
         
     # Fallback: If scene_id is still missing, generate sequential IDs from row index
     if 'scene_id' not in df.columns:
-        df['scene_id'] = range(1, len(df) + 1)
+        df['scene_id'] = list(range(1, len(df) + 1))
         
     if 'prompt' not in df.columns:
         df['prompt'] = "stick figure drawing"
@@ -359,52 +359,7 @@ with tab5:
         from kaggle_runner import get_resume_status
         try:
             resume_info = get_resume_status(active_manifest_path)
-            if isinstance(resume_info, dict) and resume_info.get("has_progress", False):
-                done_c = resume_info.get("done_chunks", 0)
-                tot_c = resume_info.get("total_chunks", 0)
-                tot_i = resume_info.get("total_images", 0)
-                st.warning(
-                    f"Found saved progress for this manifest: "
-                    f"{done_c}/{tot_c} chunks "
-                    f"(~{done_c * 25} of {tot_i} images) already done. "
-                    f"Clicking the button below will resume, not restart."
-                )
+            if resume_info.get("has_progress"):
+                st.success(f"Found saved progress: {resume_info['done_chunks']}/{resume_info['total_chunks']} chunks completed.")
         except Exception:
-            resume_info = None
-
-    button_label = "Resume image generation" if resume_info and resume_info.get("has_progress") else "Generate images"
-
-    if st.button(button_label, type="primary", key="btn_gen_images"):
-        if not active_manifest_path or not os.path.exists(active_manifest_path):
-            st.warning("No manifest found — run step 3 (Align) first, or upload a scene_manifest.csv here.")
-        else:
-            from kaggle_runner import run_image_generation_chunked
-            kaggle_user = get_secret("KAGGLE_USERNAME", kaggle_user_override)
-            kaggle_key = get_secret("KAGGLE_KEY", kaggle_key_override)
-
-            if not kaggle_user or not kaggle_key:
-                st.error("Missing Kaggle Credentials! Please enter your Kaggle Username and API Key.")
-            else:
-                progress_bar = st.progress(0.0)
-                status_text = st.empty()
-
-                def on_progress(done_chunks, total_chunks, done_images, total_images, message):
-                    pct = done_chunks / total_chunks if total_chunks else 0
-                    progress_bar.progress(pct)
-                    status_text.markdown(f"**{done_images}/{total_images} images** "
-                                         f"({done_chunks}/{total_chunks} chunks) — {message}")
-
-                try:
-                    # SANITIZE MANIFEST BEFORE KAGGLE EXECUTION
-                    force_fix_manifest_csv(active_manifest_path)
-                    
-                    zip_path = run_image_generation_chunked(
-                        active_manifest_path, kaggle_user, kaggle_key,
-                        progress_callback=on_progress)
-                    progress_bar.progress(1.0)
-                    st.success("All images generated.")
-                    with open(zip_path, "rb") as f:
-                        st.download_button("Download scene_images_batch.zip", f, file_name="scene_images_batch.zip")
-                except Exception as e:
-                    st.error(f"Stopped: {e}")
-                    st.info("Progress up to the last completed chunk is saved. Click the button again to resume from there.")
+            pass
