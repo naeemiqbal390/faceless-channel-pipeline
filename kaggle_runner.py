@@ -39,6 +39,9 @@ try:
         raise FileNotFoundError(f"Manifest not found at {{manifest_path}}")
 
     df = pd.read_csv(manifest_path)
+    # Strip whitespace, remove BOM characters, and force lowercase column names
+    df.columns = df.columns.str.strip().str.replace('\\ufeff', '').str.lower()
+
     OUTPUT_DIR = "/kaggle/working/scene_images"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -56,14 +59,16 @@ try:
 
     NEGATIVE_PROMPT = "photorealistic, photograph, 3d render, realistic skin, hyperrealism, blurry, low quality, text, watermark"
 
-    for _, row in df.iterrows():
-        scene_id = int(row["scene_id"])
+    for idx, row in df.iterrows():
+        # Safely extract scene_id with fallback options
+        scene_id_val = row.get("scene_id", row.get("scene", idx + 1))
+        scene_id = int(scene_id_val)
         fname = f"scene_{scene_id:03d}.png"
         out_path = os.path.join(OUTPUT_DIR, fname)
         if os.path.exists(out_path):
             continue
             
-        prompt_text = str(row["prompt"]) if pd.notna(row["prompt"]) else "stick figure drawing"
+        prompt_text = str(row.get("prompt", "stick figure drawing")) if pd.notna(row.get("prompt")) else "stick figure drawing"
         image = pipe(
             prompt=prompt_text,
             negative_prompt=NEGATIVE_PROMPT,
@@ -126,6 +131,7 @@ def get_resume_status(manifest_path, chunk_size=25):
     try:
         run_id = compute_run_id(manifest_path)
         df = pd.read_csv(manifest_path)
+        df.columns = df.columns.str.strip().str.replace('\ufeff', '').str.lower()
         total_chunks = (len(df) + chunk_size - 1) // chunk_size
         state = _load_state(run_id, manifest_path=manifest_path)
         done = len(state.get("completed_chunks", []))
@@ -325,6 +331,8 @@ def run_image_generation_chunked(manifest_path, kaggle_username, kaggle_key,
     os.makedirs(run_dir, exist_ok=True)
 
     df = pd.read_csv(manifest_path)
+    df.columns = df.columns.str.strip().str.replace('\ufeff', '').str.lower()
+
     total_images = len(df)
     chunks = [df.iloc[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
     total_chunks = len(chunks)
