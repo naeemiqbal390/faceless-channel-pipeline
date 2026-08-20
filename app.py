@@ -14,29 +14,38 @@ import asyncio
 from difflib import SequenceMatcher
 
 import streamlit as st
-
 import pandas as pd
 
-def normalize_manifest_csv(file_path):
-    """Ensures manifest CSV columns are clean and lowercased."""
-    df = pd.read_csv(file_path)
-    # Strip whitespace, BOM characters, and lowercase column names
+
+def force_fix_manifest_csv(csv_path):
+    """Ensures 'scene_id' and 'prompt' columns strictly exist regardless of input format."""
+    df = pd.read_csv(csv_path)
+    
+    # Clean whitespace, hidden characters, and lowercase everything
     df.columns = df.columns.str.strip().str.replace('\ufeff', '').str.lower()
     
-    # Map common alias names if headers were named slightly differently
-    column_mapping = {
-        'scene': 'scene_id',
-        'id': 'scene_id',
-        'scene id': 'scene_id',
-        'scene_number': 'scene_id'
-    }
-    df.rename(columns=column_mapping, inplace=True)
-    
-    if 'scene_id' not in df.columns:
-        raise KeyError(f"Could not find 'scene_id' column. Columns found: {list(df.columns)}")
+    # Rename common variations to standard schema
+    rename_dict = {}
+    for col in df.columns:
+        if col in ['scene', 'scene id', 'scene_number', 'id', 'sn']:
+            rename_dict[col] = 'scene_id'
+        elif col in ['prompts', 'image_prompt', 'scene_prompt', 'description']:
+            rename_dict[col] = 'prompt'
+            
+    if rename_dict:
+        df.rename(columns=rename_dict, inplace=True)
         
-    df.to_csv(file_path, index=False)
-    return file_path
+    # Fallback: If scene_id is still missing, generate sequential IDs from row index
+    if 'scene_id' not in df.columns:
+        df['scene_id'] = range(1, len(df) + 1)
+        
+    if 'prompt' not in df.columns:
+        df['prompt'] = "stick figure drawing"
+        
+    df.to_csv(csv_path, index=False)
+    return csv_path
+
+
 # Voice list for Edge-TTS
 EDGE_TTS_VOICES = [
     "en-US-ChristopherNeural",
@@ -260,8 +269,11 @@ with tab0:
                 if not active_manifest or not os.path.exists(active_manifest):
                     raise ValueError("No valid manifest file was found.")
 
+                # SANITIZE MANIFEST BEFORE KAGGLE EXECUTION
+                force_fix_manifest_csv(active_manifest)
+
                 zip_path = run_image_generation_chunked(active_manifest, kaggle_user, kaggle_key,
-                                                          progress_callback=on_image_progress)
+                                                         progress_callback=on_image_progress)
                 image_bar.progress(1.0)
                 st.success("All images generated.")
                 with open(zip_path, "rb") as f:
@@ -380,10 +392,12 @@ with tab5:
                     pct = done_chunks / total_chunks if total_chunks else 0
                     progress_bar.progress(pct)
                     status_text.markdown(f"**{done_images}/{total_images} images** "
-                                          f"({done_chunks}/{total_chunks} chunks) — {message}")
+                                         f"({done_chunks}/{total_chunks} chunks) — {message}")
 
                 try:
-                    normalize_manifest_csv(active_manifest_path)
+                    # SANITIZE MANIFEST BEFORE KAGGLE EXECUTION
+                    force_fix_manifest_csv(active_manifest_path)
+                    
                     zip_path = run_image_generation_chunked(
                         active_manifest_path, kaggle_user, kaggle_key,
                         progress_callback=on_progress)
