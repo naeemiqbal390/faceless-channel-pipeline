@@ -189,7 +189,7 @@ with tab0:
     voice_auto = st.selectbox("Voice", EDGE_TTS_VOICES, key="voice_auto")
     kaggle_user_auto = st.text_input("Kaggle username (leave blank if set in Secrets)", key="ku_auto")
     kaggle_key_auto = st.text_input("Kaggle API key (leave blank if set in Secrets)", type="password", key="kk_auto")
-    if col_b.button("Run full pipeline", type="primary"):
+if col_b.button("Run full pipeline", type="primary"):
         if "[SCENE" not in pasted_script:
             st.warning("No [SCENE N: ...] markers found — check you pasted the full script.")
         else:
@@ -225,7 +225,13 @@ with tab0:
                 from kaggle_runner import run_image_generation_chunked
                 kaggle_user = get_secret("KAGGLE_USERNAME", kaggle_user_auto)
                 kaggle_key = get_secret("KAGGLE_KEY", kaggle_key_auto)
-                zip_path = run_image_generation_chunked(manifest_path, kaggle_user, kaggle_key,
+                
+                # Check that manifest_path exists in session state before calling
+                active_manifest = st.session_state.get("manifest_path", None)
+                if not active_manifest:
+                    raise ValueError("Manifest file was not created properly during alignment step.")
+
+                zip_path = run_image_generation_chunked(active_manifest, kaggle_user, kaggle_key,
                                                           progress_callback=on_image_progress)
                 image_bar.progress(1.0)
                 st.success("All images generated.")
@@ -234,7 +240,6 @@ with tab0:
             except Exception as e:
                 st.error(f"Pipeline stopped at an error: {e}")
                 st.info("Progress up to the last completed step/chunk is saved — click 'Run full pipeline' again to resume rather than restart.")
-                st.info("Whatever completed before the error is saved — check the individual tabs above to pick up from there.")
 
 with tab3:
     default_script = st.session_state.get("script_text", "")
@@ -286,29 +291,23 @@ with tab4:
                         st.download_button("Download scene_manifest.csv", f, file_name="scene_manifest.csv")
                 except Exception as e:
                     st.error(f"Alignment failed: {e}")
-
 with tab5:
-    # 1. Store uploaded CSV into session state immediately if provided
-    uploaded_manifest = st.file_uploader(
-        "scene_manifest.csv (optional — auto-used from step 3 if you skip this)", 
-        type=["csv"], 
-        key="tab5_uploader"
-    )
+    uploaded_manifest = st.file_uploader("scene_manifest.csv (optional — auto-used from step 3 if you skip this)", type=["csv"], key="tab5_uploader")
 
+    # If user uploads a file directly in this tab, write it to temp storage and save path in session_state
     if uploaded_manifest is not None:
         temp_manifest_path = os.path.join(tempfile.gettempdir(), "uploaded_scene_manifest.csv")
         with open(temp_manifest_path, "wb") as f:
             f.write(uploaded_manifest.getvalue())
         st.session_state["manifest_path"] = temp_manifest_path
 
-    has_saved_manifest = "manifest_path" in st.session_state
-    if has_saved_manifest:
-        st.info("Scene manifest loaded and ready.")
+    active_manifest_path = st.session_state.get("manifest_path", None)
+
+    if active_manifest_path and os.path.exists(active_manifest_path):
+        st.info(f"Loaded manifest: {os.path.basename(active_manifest_path)}")
 
     kaggle_user_override = st.text_input("Kaggle username (leave blank if set in Secrets)", key="tab5_user")
     kaggle_key_override = st.text_input("Kaggle API key (leave blank if set in Secrets)", type="password", key="tab5_key")
-
-    active_manifest_path = st.session_state.get("manifest_path", None)
 
     resume_info = None
     if active_manifest_path and os.path.exists(active_manifest_path):
