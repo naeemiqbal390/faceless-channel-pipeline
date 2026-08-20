@@ -34,10 +34,10 @@ def load_and_fix_manifest(csv_path):
     except Exception:
         df = pd.read_csv(csv_path)
 
-    # Clean whitespace, BOM characters, and lowercase headers
+    # 1. Clean whitespace, BOM characters, and lowercase headers
     df.columns = df.columns.astype(str).str.strip().str.replace('\ufeff', '').str.lower()
 
-    # Map header aliases to expected names
+    # 2. Map header aliases to expected names
     rename_dict = {}
     for col in df.columns:
         if col in ['scene', 'scene id', 'scene_number', 'id', 'sn', 'unnamed: 0']:
@@ -48,19 +48,18 @@ def load_and_fix_manifest(csv_path):
     if rename_dict:
         df.rename(columns=rename_dict, inplace=True)
 
-    # Hard Fallback: Auto-inject scene_id if completely missing
+    # 3. Hard Fallbacks: Auto-inject missing columns BEFORE attempting access
     if 'scene_id' not in df.columns:
         df['scene_id'] = list(range(1, len(df) + 1))
 
-    # Hard Fallback: Auto-inject default prompt if missing
     if 'prompt' not in df.columns:
         df['prompt'] = "stick figure drawing"
 
-    # Ensure scene_id is integer-based safely (FIXED: Converts range to Series matching index)
+    # 4. Convert scene_id safely using Series index matching
     fallback_series = pd.Series(range(1, len(df) + 1), index=df.index)
     df['scene_id'] = pd.to_numeric(df['scene_id'], errors='coerce').fillna(fallback_series).astype(int)
     
-    # Save clean copy over the file
+    # 5. Overwrite manifest with sanitized version
     df.to_csv(csv_path, index=False, encoding='utf-8')
     return df
 
@@ -109,7 +108,6 @@ try:
     NEGATIVE_PROMPT = "photorealistic, photograph, 3d render, realistic skin, hyperrealism, blurry, low quality, text, watermark"
 
     for idx, row in df.iterrows():
-        # Safely extract scene_id with fallback options
         scene_id_val = row.get("scene_id", row.get("scene", idx + 1))
         try:
             scene_id = int(scene_id_val)
@@ -148,8 +146,6 @@ def _run_kaggle_cli(args, env):
 
 
 def compute_run_id(manifest_path):
-    """A stable ID derived from the manifest's content, so resuming the
-    same video's manifest always finds the same saved progress."""
     try:
         with open(manifest_path, "rb") as f:
             return hashlib.sha256(f.read()).hexdigest()[:16]
@@ -181,7 +177,6 @@ def _save_state(run_id, state):
 
 
 def get_resume_status(manifest_path, chunk_size=25):
-    """Check if there's existing progress for this exact manifest safely."""
     try:
         df = load_and_fix_manifest(manifest_path)
         run_id = compute_run_id(manifest_path)
@@ -283,8 +278,6 @@ def _attempt_chunk_once(chunk_df, kaggle_username, kaggle_key, chunk_index,
     _wait_for_dataset_ready(dataset_slug, env)
 
     extra_buffer_s = 60 * attempt_number
-    print(f"Chunk {chunk_index}, attempt {attempt_number}: dataset downloadable, "
-          f"waiting {extra_buffer_s}s extra for kernel-attachment indexing...")
     time.sleep(extra_buffer_s)
 
     kernel_dir = os.path.join(work_dir, "kernel")
@@ -364,8 +357,6 @@ def _run_single_chunk(chunk_df, kaggle_username, kaggle_key, chunk_index,
         except _ChunkAttemptError as e:
             last_error = e
             if attempt < max_attempts and _is_manifest_not_found_signature(e.log_tail):
-                print(f"Chunk {chunk_index}, attempt {attempt}: hit the known dataset-indexing "
-                      f"delay signature — retrying with a longer buffer (attempt {attempt + 1}/{max_attempts}).")
                 continue
             raise RuntimeError(str(e))
 
@@ -374,11 +365,7 @@ def _run_single_chunk(chunk_df, kaggle_username, kaggle_key, chunk_index,
 
 def run_image_generation_chunked(manifest_path, kaggle_username, kaggle_key,
                                   chunk_size=25, progress_callback=None):
-    """
-    Runs image generation in chunks, saving real progress to disk after
-    each one. Automatically resumes from the first incomplete chunk if
-    called again on the same manifest.
-    """
+    # Runs the sanitizer first to enforce 'scene_id' and 'prompt' presence
     df = load_and_fix_manifest(manifest_path)
 
     run_id = compute_run_id(manifest_path)
@@ -428,6 +415,5 @@ def run_image_generation_chunked(manifest_path, kaggle_username, kaggle_key,
 
 
 def run_image_generation_on_kaggle(manifest_path, kaggle_username, kaggle_key, timeout_minutes=60):
-    """Kept for backward compatibility — single-shot version without chunking."""
     zip_path = run_image_generation_chunked(manifest_path, kaggle_username, kaggle_key)
     return zip_path, "Images generated successfully via Kaggle (chunked run)."
