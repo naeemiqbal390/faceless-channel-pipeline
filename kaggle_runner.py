@@ -20,6 +20,50 @@ import pandas as pd
 
 RUNS_DIR = os.path.join(tempfile.gettempdir(), "pipeline_runs")
 
+
+def load_and_fix_manifest(csv_path):
+    """
+    Reads the manifest CSV and guarantees 'scene_id' and 'prompt' columns 
+    exist with zero whitespace, BOM, or casing bugs.
+    """
+    if not csv_path or not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Manifest file not found at: {csv_path}")
+
+    try:
+        df = pd.read_csv(csv_path, encoding='utf-8-sig')
+    except Exception:
+        df = pd.read_csv(csv_path)
+
+    # Clean whitespace, BOM characters, and lowercase headers
+    df.columns = df.columns.astype(str).str.strip().str.replace('\ufeff', '').str.lower()
+
+    # Map header aliases to expected names
+    rename_dict = {}
+    for col in df.columns:
+        if col in ['scene', 'scene id', 'scene_number', 'id', 'sn', 'unnamed: 0']:
+            rename_dict[col] = 'scene_id'
+        elif col in ['prompts', 'image_prompt', 'scene_prompt', 'description', 'text']:
+            rename_dict[col] = 'prompt'
+
+    if rename_dict:
+        df.rename(columns=rename_dict, inplace=True)
+
+    # Hard Fallback: Auto-inject scene_id if completely missing
+    if 'scene_id' not in df.columns:
+        df['scene_id'] = range(1, len(df) + 1)
+
+    # Hard Fallback: Auto-inject default prompt if missing
+    if 'prompt' not in df.columns:
+        df['prompt'] = "stick figure drawing"
+
+    # Ensure scene_id is integer-based
+    df['scene_id'] = pd.to_numeric(df['scene_id'], errors='coerce').fillna(range(1, len(df) + 1)).astype(int)
+    
+    # Save clean copy over the file
+    df.to_csv(csv_path, index=False, encoding='utf-8')
+    return df
+
+
 KERNEL_SCRIPT_TEMPLATE = '''
 import os, sys, subprocess, shutil, traceback
 
@@ -38,9 +82,13 @@ try:
     if not os.path.exists(manifest_path):
         raise FileNotFoundError(f"Manifest not found at {{manifest_path}}")
 
-    df = pd.read_csv(manifest_path)
+    try:
+        df = pd.read_csv(manifest_path, encoding='utf-8-sig')
+    except Exception:
+        df = pd.read_csv(manifest_path)
+
     # Strip whitespace, remove BOM characters, and force lowercase column names
-    df.columns = df.columns.str.strip().str.replace('\\ufeff', '').str.lower()
+    df.columns = df.columns.astype(str).str.strip().str.replace('\\ufeff', '').str.lower()
 
     OUTPUT_DIR = "/kaggle/working/scene_images"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -62,7 +110,11 @@ try:
     for idx, row in df.iterrows():
         # Safely extract scene_id with fallback options
         scene_id_val = row.get("scene_id", row.get("scene", idx + 1))
-        scene_id = int(scene_id_val)
+        try:
+            scene_id = int(scene_id_val)
+        except (ValueError, TypeError):
+            scene_id = idx + 1
+
         fname = f"scene_{scene_id:03d}.png"
         out_path = os.path.join(OUTPUT_DIR, fname)
         if os.path.exists(out_path):
@@ -85,6 +137,7 @@ except Exception as e:
     traceback.print_exc()
     raise
 '''
+
 
 def _run_kaggle_cli(args, env):
     result = subprocess.run(["kaggle"] + args, capture_output=True, text=True, env=env)
@@ -129,9 +182,8 @@ def _save_state(run_id, state):
 def get_resume_status(manifest_path, chunk_size=25):
     """Check if there's existing progress for this exact manifest safely."""
     try:
+        df = load_and_fix_manifest(manifest_path)
         run_id = compute_run_id(manifest_path)
-        df = pd.read_csv(manifest_path)
-        df.columns = df.columns.str.strip().str.replace('\ufeff', '').str.lower()
         total_chunks = (len(df) + chunk_size - 1) // chunk_size
         state = _load_state(run_id, manifest_path=manifest_path)
         done = len(state.get("completed_chunks", []))
@@ -222,7 +274,7 @@ def _attempt_chunk_once(chunk_df, kaggle_username, kaggle_key, chunk_index,
 
     dataset_dir = os.path.join(work_dir, "dataset")
     os.makedirs(dataset_dir, exist_ok=True)
-    chunk_df.to_csv(os.path.join(dataset_dir, "scene_manifest.csv"), index=False)
+    chunk_df.to_csv(os.path.join(dataset_dir, "scene_manifest.csv"), index=False, encoding='utf-8')
     with open(os.path.join(dataset_dir, "dataset-metadata.json"), "w") as f:
         json.dump({"title": dataset_slug_name, "id": dataset_slug, "licenses": [{"name": "CC0-1.0"}]}, f)
     _run_kaggle_cli(["datasets", "create", "-p", dataset_dir, "-q"], env)
@@ -320,18 +372,17 @@ def _run_single_chunk(chunk_df, kaggle_username, kaggle_key, chunk_index,
 
 
 def run_image_generation_chunked(manifest_path, kaggle_username, kaggle_key,
-                                   chunk_size=25, progress_callback=None):
+                                  chunk_size=25, progress_callback=None):
     """
     Runs image generation in chunks, saving real progress to disk after
     each one. Automatically resumes from the first incomplete chunk if
     called again on the same manifest.
     """
+    df = load_and_fix_manifest(manifest_path)
+
     run_id = compute_run_id(manifest_path)
     run_dir = os.path.join(RUNS_DIR, run_id)
     os.makedirs(run_dir, exist_ok=True)
-
-    df = pd.read_csv(manifest_path)
-    df.columns = df.columns.str.strip().str.replace('\ufeff', '').str.lower()
 
     total_images = len(df)
     chunks = [df.iloc[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
