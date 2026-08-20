@@ -35,76 +35,57 @@ import pandas as pd
 RUNS_DIR = os.path.join(tempfile.gettempdir(), "pipeline_runs")
 
 KERNEL_SCRIPT_TEMPLATE = '''
-import subprocess, sys
+import os, sys, subprocess, shutil, traceback
 
 def log(msg):
     print(msg, flush=True)
 
-# Kaggle's default P100 GPU (compute capability sm_60) is not supported by
-# the newest pre-installed torch builds (sm_70+ only). Pin a P100-compatible
-# torch/torchvision build BEFORE torch is imported anywhere in this process,
-# so generation actually runs on GPU instead of crashing or silently
-# falling back to CPU.
-try:
-    import torch as _torch_probe
-    _cap = _torch_probe.cuda.get_device_capability(0) if _torch_probe.cuda.is_available() else None
-except Exception:
-    _cap = None
-
-if _cap is None or _cap[0] < 7:
-    log("Installing a GPU-compatible torch/torchvision build...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-                     "torch==2.1.2", "torchvision==0.16.2",
-                     "--index-url", "https://download.pytorch.org/whl/cu118"],
-                    check=False)
-
-subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-                 "diffusers", "accelerate", "transformers"],
-                check=True)
+log("Installing stable diffusion dependencies...")
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "diffusers==0.27.2", "transformers", "accelerate"], check=True)
 
 import pandas as pd
 import torch
 from diffusers import StableDiffusionPipeline
-import os, shutil, traceback
 
 try:
-    df = pd.read_csv("/kaggle/input/{dataset_slug}/scene_manifest.csv")
+    manifest_path = "/kaggle/input/{dataset_slug}/scene_manifest.csv"
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(f"Manifest not found at {manifest_path}")
+
+    df = pd.read_csv(manifest_path)
     OUTPUT_DIR = "/kaggle/working/scene_images"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
-    log(f"Loading Stable Diffusion 1.5 on {{device}}...")
+    log(f"Loading Stable Diffusion on {device}...")
+
     pipe = StableDiffusionPipeline.from_pretrained(
         "runwayml/stable-diffusion-v1-5",
         torch_dtype=dtype,
-        safety_checker=None,
+        safety_checker=None
     )
     pipe = pipe.to(device)
-    log("Model loaded.")
+    log("Model loaded successfully.")
 
-    NEGATIVE_PROMPT = (
-        "photorealistic, photograph, 3d render, realistic skin, hyperrealism, "
-        "blurry, low quality, text, watermark, extra limbs, deformed"
-    )
-
-    def safe_time(t):
-        return str(t).replace(":", "-")
+    NEGATIVE_PROMPT = "photorealistic, photograph, 3d render, realistic skin, hyperrealism, blurry, low quality, text, watermark"
 
     for _, row in df.iterrows():
         scene_id = int(row["scene_id"])
-        fname = f"scene_{{scene_id:03d}}_{{safe_time(row['start_time'])}}_{{safe_time(row['end_time'])}}.png"
+        fname = f"scene_{scene_id:03d}.png"
         out_path = os.path.join(OUTPUT_DIR, fname)
         if os.path.exists(out_path):
             continue
+            
+        prompt_text = str(row["prompt"]) if pd.notna(row["prompt"]) else "stick figure drawing"
         image = pipe(
-            prompt=row["prompt"],
+            prompt=prompt_text,
             negative_prompt=NEGATIVE_PROMPT,
-            width=768, height=432,
-            num_inference_steps=25, guidance_scale=7.5,
+            width=512, height=512,
+            num_inference_steps=20, guidance_scale=7.5,
         ).images[0]
         image.save(out_path)
-        log(f"Saved {{fname}}")
+        log(f"Saved {fname}")
 
     shutil.make_archive("/kaggle/working/scene_images_batch", "zip", OUTPUT_DIR)
     log("DONE")
@@ -113,7 +94,6 @@ except Exception as e:
     traceback.print_exc()
     raise
 '''
-
 
 def _run_kaggle_cli(args, env):
     result = subprocess.run(["kaggle"] + args, capture_output=True, text=True, env=env)
@@ -253,7 +233,7 @@ def _attempt_chunk_once(chunk_df, kaggle_username, kaggle_key, chunk_index,
     # Extra buffer on top of download-confirmation, specifically for that
     # slower attachment-index layer. Grows on retry in case one buffer
     # length still isn't enough for a given run.
-    extra_buffer_s = 45 * attempt_number
+    extra_buffer_s = 60 * attempt_number
     print(f"Chunk {chunk_index}, attempt {attempt_number}: dataset downloadable, "
           f"waiting {extra_buffer_s}s extra for kernel-attachment indexing...")
     time.sleep(extra_buffer_s)
