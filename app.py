@@ -15,6 +15,28 @@ from difflib import SequenceMatcher
 
 import streamlit as st
 
+import pandas as pd
+
+def normalize_manifest_csv(file_path):
+    """Ensures manifest CSV columns are clean and lowercased."""
+    df = pd.read_csv(file_path)
+    # Strip whitespace, BOM characters, and lowercase column names
+    df.columns = df.columns.str.strip().str.replace('\ufeff', '').str.lower()
+    
+    # Map common alias names if headers were named slightly differently
+    column_mapping = {
+        'scene': 'scene_id',
+        'id': 'scene_id',
+        'scene id': 'scene_id',
+        'scene_number': 'scene_id'
+    }
+    df.rename(columns=column_mapping, inplace=True)
+    
+    if 'scene_id' not in df.columns:
+        raise KeyError(f"Could not find 'scene_id' column. Columns found: {list(df.columns)}")
+        
+    df.to_csv(file_path, index=False)
+    return file_path
 # Voice list for Edge-TTS
 EDGE_TTS_VOICES = [
     "en-US-ChristopherNeural",
@@ -361,6 +383,7 @@ with tab5:
                                           f"({done_chunks}/{total_chunks} chunks) — {message}")
 
                 try:
+                    normalize_manifest_csv(active_manifest_path)
                     zip_path = run_image_generation_chunked(
                         active_manifest_path, kaggle_user, kaggle_key,
                         progress_callback=on_progress)
