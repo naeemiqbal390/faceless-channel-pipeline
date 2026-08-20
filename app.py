@@ -269,7 +269,6 @@ with tab0:
                 if not active_manifest or not os.path.exists(active_manifest):
                     raise ValueError("No valid manifest file was found.")
 
-                # SANITIZE MANIFEST BEFORE KAGGLE EXECUTION
                 force_fix_manifest_csv(active_manifest)
 
                 zip_path = run_image_generation_chunked(active_manifest, kaggle_user, kaggle_key,
@@ -334,8 +333,10 @@ with tab4:
                     st.error(f"Alignment failed: {e}")
 
 with tab5:
+    st.markdown("### Generate Images on Kaggle")
+    
     uploaded_manifest = st.file_uploader(
-        "scene_manifest.csv (optional — auto-used from step 3 if you skip this)", 
+        "scene_manifest.csv (optional — auto-used from step 3 if skipped)", 
         type=["csv"], 
         key="tab5_uploader"
     )
@@ -350,12 +351,6 @@ with tab5:
 
     if active_manifest_path and os.path.exists(active_manifest_path):
         st.info(f"Loaded manifest ready: {os.path.basename(active_manifest_path)}")
-
-    kaggle_user_override = st.text_input("Kaggle username (leave blank if set in Secrets)", key="tab5_user")
-    kaggle_key_override = st.text_input("Kaggle API key (leave blank if set in Secrets)", type="password", key="tab5_key")
-
-    resume_info = None
-    if active_manifest_path and os.path.exists(active_manifest_path):
         from kaggle_runner import get_resume_status
         try:
             resume_info = get_resume_status(active_manifest_path)
@@ -363,3 +358,51 @@ with tab5:
                 st.success(f"Found saved progress: {resume_info['done_chunks']}/{resume_info['total_chunks']} chunks completed.")
         except Exception:
             pass
+    else:
+        st.warning("No active manifest found. Upload a CSV manifest above or run Alignment in step 3.")
+
+    kaggle_user_override = st.text_input("Kaggle username (leave blank if set in Secrets)", key="tab5_user")
+    kaggle_key_override = st.text_input("Kaggle API key (leave blank if set in Secrets)", type="password", key="tab5_key")
+
+    if st.button("Generate Images on Kaggle", type="primary"):
+        if not active_manifest_path or not os.path.exists(active_manifest_path):
+            st.error("Missing manifest file! Please upload a CSV or complete step 3.")
+        else:
+            try:
+                kaggle_user = get_secret("KAGGLE_USERNAME", kaggle_user_override)
+                kaggle_key = get_secret("KAGGLE_KEY", kaggle_key_override)
+                
+                if not kaggle_user or not kaggle_key:
+                    st.error("Kaggle credentials missing. Enter username & key above or add to Secrets.")
+                else:
+                    image_bar = st.progress(0.0)
+                    image_status = st.empty()
+
+                    def on_image_progress(done_chunks, total_chunks, done_images, total_images, message):
+                        pct = done_chunks / total_chunks if total_chunks else 0
+                        image_bar.progress(pct)
+                        image_status.markdown(f"**{done_images}/{total_images} images** — {message}")
+
+                    from kaggle_runner import run_image_generation_chunked
+                    
+                    # Sanitize CSV before handing off
+                    force_fix_manifest_csv(active_manifest_path)
+
+                    zip_path = run_image_generation_chunked(
+                        active_manifest_path, 
+                        kaggle_user, 
+                        kaggle_key,
+                        progress_callback=on_image_progress
+                    )
+                    
+                    image_bar.progress(1.0)
+                    st.success("All images generated successfully!")
+                    with open(zip_path, "rb") as f:
+                        st.download_button(
+                            "Download scene_images_batch.zip", 
+                            f, 
+                            file_name="scene_images_batch.zip",
+                            mime="application/zip"
+                        )
+            except Exception as e:
+                st.error(f"Image generation failed: {e}")
