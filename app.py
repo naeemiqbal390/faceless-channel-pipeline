@@ -1,38 +1,60 @@
 """
-app.py — Fully audited version with complete state safety and CSV path standardization.
+app.py
+
+Streamlit web UI for the Faceless Channel Pipeline.
+Automates TTS audio generation, Whisper alignment to CSV manifest, and Kaggle execution.
 """
 
 import os
 import re
 import csv
-import time
-import asyncio
+import json
 import tempfile
+import asyncio
 from difflib import SequenceMatcher
 
 import streamlit as st
 
+# Voice list for Edge-TTS
 EDGE_TTS_VOICES = [
-    "en-US-GuyNeural", "en-US-JennyNeural", "en-US-AriaNeural",
-    "en-GB-RyanNeural", "en-GB-SoniaNeural", "en-AU-WilliamNeural",
+    "en-US-ChristopherNeural",
+    "en-US-GuyNeural",
+    "en-US-JennyNeural",
+    "en-US-AriaNeural",
+    "en-GB-SoniaNeural",
+    "en-GB-RyanNeural",
+    "en-AU-WilliamNeural",
 ]
 
 
-def get_secret(key, override=""):
-    if override and str(override).strip():
-        return str(override).strip()
+def get_secret(key_name, user_input=""):
+    """
+    Safely retrieves secrets from Streamlit secrets or form input fallback.
+    """
+    if user_input and user_input.strip():
+        return user_input.strip()
     try:
-        val = st.secrets.get(key, "")
-        if val:
-            return str(val).strip()
+        return st.secrets[key_name]
     except Exception:
-        pass
-    return os.environ.get(key, "").strip()
+        return ""
 
 
 # ============================================================
 # Core logic functions
 # ============================================================
+
+def parse_script_scenes(raw):
+    pattern = re.compile(r"\[SCENE\s+\d+:\s*(.*?)\]", re.IGNORECASE | re.DOTALL)
+    matches = list(pattern.finditer(raw))
+    scenes = []
+    for i, m in enumerate(matches):
+        prompt = m.group(1).strip().replace("\n", " ")
+        start_pos = m.end()
+        end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+        narration = raw[start_pos:end_pos].strip()
+        scenes.append({"scene_id": i + 1, "prompt": prompt, "narration": narration})
+    return scenes
+
 
 def generate_audio_file(script_text, voice, progress_callback=None, scenes_per_chunk=7):
     scenes = parse_script_scenes(script_text)
@@ -70,19 +92,6 @@ def generate_audio_file(script_text, voice, progress_callback=None, scenes_per_c
     return out_path
 
 
-def parse_script_scenes(raw):
-    pattern = re.compile(r"\[SCENE\s+\d+:\s*(.*?)\]", re.IGNORECASE | re.DOTALL)
-    matches = list(pattern.finditer(raw))
-    scenes = []
-    for i, m in enumerate(matches):
-        prompt = m.group(1).strip().replace("\n", " ")
-        start_pos = m.end()
-        end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
-        narration = raw[start_pos:end_pos].strip()
-        scenes.append({"scene_id": i + 1, "prompt": prompt, "narration": narration})
-    return scenes
-
-
 def align_script_to_audio_file(script_text, audio_path):
     scenes = parse_script_scenes(script_text)
     if not scenes:
@@ -93,8 +102,9 @@ def align_script_to_audio_file(script_text, audio_path):
     segments, _ = model.transcribe(audio_path, word_timestamps=True)
     whisper_words = []
     for seg in segments:
-        for w in seg.words:
-            whisper_words.append({"word": w.word.strip().lower(), "start": w.start, "end": w.end})
+        if seg.words:
+            for w in seg.words:
+                whisper_words.append({"word": w.word.strip().lower(), "start": w.start, "end": w.end})
 
     def normalize(text):
         return re.sub(r"[^\w\s]", "", text.lower()).split()
@@ -103,13 +113,15 @@ def align_script_to_audio_file(script_text, audio_path):
     cursor = 0
     for scene in scenes:
         target_words = normalize(scene["narration"])
-        if not target_words:
+        if not target_words or not whisper_words:
             scene["start_time"], scene["end_time"] = None, None
             continue
+
         window_end = min(len(plain_words), cursor + len(target_words) * 3 + 20)
         window = plain_words[cursor:window_end]
         matcher = SequenceMatcher(None, window, target_words)
         match = matcher.find_longest_match(0, len(window), 0, len(target_words))
+        
         if match.size == 0:
             span_len = min(len(target_words), len(window)) or 1
             start_idx = cursor
@@ -118,8 +130,10 @@ def align_script_to_audio_file(script_text, audio_path):
             start_idx = cursor + match.a
             approx_span = max(match.size, len(target_words) - match.b)
             end_idx = min(start_idx + approx_span - 1, len(whisper_words) - 1)
+
         start_idx = max(0, min(start_idx, len(whisper_words) - 1))
         end_idx = max(start_idx, min(end_idx, len(whisper_words) - 1))
+        
         scene["start_time"] = whisper_words[start_idx]["start"]
         scene["end_time"] = whisper_words[end_idx]["end"]
         cursor = end_idx + 1
@@ -146,10 +160,11 @@ def align_script_to_audio_file(script_text, audio_path):
 # ============================================================
 
 st.set_page_config(page_title="Faceless Channel Pipeline", layout="wide")
+
 st.title("Faceless Channel Pipeline")
 st.caption("Stick-figure style · unlimited characters · zero cost")
 
-# Safely initialize session state
+# Ensure state keys exist safely
 if "manifest_path" not in st.session_state:
     st.session_state["manifest_path"] = None
 
@@ -219,9 +234,6 @@ with tab0:
                 kaggle_user = get_secret("KAGGLE_USERNAME", kaggle_user_auto)
                 kaggle_key = get_secret("KAGGLE_KEY", kaggle_key_auto)
                 
-                if not kaggle_user or not kaggle_key:
-                    raise ValueError("Missing Kaggle Credentials! Check your username and API key.")
-
                 active_manifest = st.session_state.get("manifest_path")
                 if not active_manifest or not os.path.exists(active_manifest):
                     raise ValueError("No valid manifest file was found.")
@@ -294,7 +306,6 @@ with tab5:
         key="tab5_uploader"
     )
 
-    # Always standardize file name to scene_manifest.csv for Kaggle compatibility
     if uploaded_manifest is not None:
         temp_manifest_path = os.path.join(tempfile.gettempdir(), "scene_manifest.csv")
         with open(temp_manifest_path, "wb") as f:
@@ -327,8 +338,7 @@ with tab5:
         except Exception:
             resume_info = None
 
-    has_prog = bool(resume_info and isinstance(resume_info, dict) and resume_info.get("has_progress"))
-    button_label = "Resume image generation" if has_prog else "Generate images"
+    button_label = "Resume image generation" if resume_info and resume_info.get("has_progress") else "Generate images"
 
     if st.button(button_label, type="primary", key="btn_gen_images"):
         if not active_manifest_path or not os.path.exists(active_manifest_path):
