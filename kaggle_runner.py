@@ -36,7 +36,7 @@ from diffusers import StableDiffusionPipeline
 try:
     manifest_path = "/kaggle/input/{dataset_slug}/scene_manifest.csv"
     if not os.path.exists(manifest_path):
-        raise FileNotFoundError(f"Manifest not found at {manifest_path}")
+        raise FileNotFoundError(f"Manifest not found at {{manifest_path}}")
 
     df = pd.read_csv(manifest_path)
     OUTPUT_DIR = "/kaggle/working/scene_images"
@@ -209,7 +209,7 @@ def _is_manifest_not_found_signature(log_tail):
 
 
 def _attempt_chunk_once(chunk_df, kaggle_username, kaggle_key, chunk_index,
-                         attempt_number, timeout_minutes, env):
+                        attempt_number, timeout_minutes, env):
     work_dir = tempfile.mkdtemp(prefix=f"kaggle_chunk_{chunk_index}_a{attempt_number}_")
     dataset_slug_name = f"chunk-{chunk_index}-{int(time.time())}"
     dataset_slug = f"{kaggle_username}/{dataset_slug_name}"
@@ -334,8 +334,8 @@ def run_image_generation_chunked(manifest_path, kaggle_username, kaggle_key,
 
     if progress_callback and completed:
         progress_callback(len(completed), total_chunks,
-                           min(len(completed) * chunk_size, total_images), total_images,
-                           f"Resuming — {len(completed)}/{total_chunks} chunks already done.")
+                          min(len(completed) * chunk_size, total_images), total_images,
+                          f"Resuming — {len(completed)}/{total_chunks} chunks already done.")
 
     for i, chunk_df in enumerate(chunks):
         if i in completed:
@@ -354,7 +354,7 @@ def run_image_generation_chunked(manifest_path, kaggle_username, kaggle_key,
         done_images = min(len(completed) * chunk_size, total_images)
         if progress_callback:
             progress_callback(len(completed), total_chunks, done_images, total_images,
-                               f"Chunk {i+1}/{total_chunks} done.")
+                              f"Chunk {i+1}/{total_chunks} done.")
 
     merged_dir = os.path.join(run_dir, "merged")
     os.makedirs(merged_dir, exist_ok=True)
