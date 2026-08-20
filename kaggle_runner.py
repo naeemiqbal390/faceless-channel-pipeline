@@ -1,9 +1,6 @@
 """
 kaggle_runner.py
-
-Handles talking to Kaggle's API on the user's behalf, split into CHUNKS so
-the app can show real, exact progress and genuinely resume after an
-interruption — rather than one opaque black-box run with no visibility.
+Chunked execution handler for Kaggle API image generation tasks.
 """
 
 import os
@@ -14,53 +11,51 @@ import shutil
 import hashlib
 import tempfile
 import subprocess
-
 import pandas as pd
-
 
 RUNS_DIR = os.path.join(tempfile.gettempdir(), "pipeline_runs")
 
 
 def load_and_fix_manifest(csv_path):
     """
-    Reads the manifest CSV and guarantees 'scene_id' and 'prompt' columns 
-    exist with zero whitespace, BOM, or casing bugs.
+    Reads and sanitizes the manifest CSV. Guarantees 'scene_id' and 'prompt' 
+    exist BEFORE any downstream access to df['scene_id'].
     """
     if not csv_path or not os.path.exists(csv_path):
         raise FileNotFoundError(f"Manifest file not found at: {csv_path}")
 
     try:
-        df = pd.read_csv(csv_path, encoding='utf-8-sig')
+        df = pd.read_csv(csv_path, encoding="utf-8-sig")
     except Exception:
         df = pd.read_csv(csv_path)
 
-    # 1. Clean whitespace, BOM characters, and lowercase headers
-    df.columns = df.columns.astype(str).str.strip().str.replace('\ufeff', '').str.lower()
+    # 1. Clean headers: strip whitespace, remove BOM characters, lower-case
+    df.columns = df.columns.astype(str).str.strip().str.replace("\ufeff", "").str.lower()
 
-    # 2. Map header aliases to expected names
+    # 2. Map structural aliases
     rename_dict = {}
     for col in df.columns:
-        if col in ['scene', 'scene id', 'scene_number', 'id', 'sn', 'unnamed: 0']:
-            rename_dict[col] = 'scene_id'
-        elif col in ['prompts', 'image_prompt', 'scene_prompt', 'description', 'text']:
-            rename_dict[col] = 'prompt'
+        if col in ["scene", "scene id", "scene_number", "id", "sn", "unnamed: 0"]:
+            rename_dict[col] = "scene_id"
+        elif col in ["prompts", "image_prompt", "scene_prompt", "description", "text"]:
+            rename_dict[col] = "prompt"
 
     if rename_dict:
         df.rename(columns=rename_dict, inplace=True)
 
-    # 3. Hard Fallbacks: Auto-inject missing columns BEFORE attempting access
-    if 'scene_id' not in df.columns:
-        df['scene_id'] = list(range(1, len(df) + 1))
+    # 3. Auto-inject required schema if missing (BEFORE any column accesses)
+    if "scene_id" not in df.columns:
+        df["scene_id"] = list(range(1, len(df) + 1))
 
-    if 'prompt' not in df.columns:
-        df['prompt'] = "stick figure drawing"
+    if "prompt" not in df.columns:
+        df["prompt"] = "stick figure drawing"
 
-    # 4. Convert scene_id safely using Series index matching
+    # 4. Safe numeric coercion
     fallback_series = pd.Series(range(1, len(df) + 1), index=df.index)
-    df['scene_id'] = pd.to_numeric(df['scene_id'], errors='coerce').fillna(fallback_series).astype(int)
-    
-    # 5. Overwrite manifest with sanitized version
-    df.to_csv(csv_path, index=False, encoding='utf-8')
+    df["scene_id"] = pd.to_numeric(df["scene_id"], errors="coerce").fillna(fallback_series).astype(int)
+
+    # 5. Overwrite sanitized manifest
+    df.to_csv(csv_path, index=False, encoding="utf-8")
     return df
 
 
@@ -87,7 +82,6 @@ try:
     except Exception:
         df = pd.read_csv(manifest_path)
 
-    # Strip whitespace, remove BOM characters, and force lowercase column names
     df.columns = df.columns.astype(str).str.strip().str.replace('\\ufeff', '').str.lower()
 
     OUTPUT_DIR = "/kaggle/working/scene_images"
@@ -95,7 +89,6 @@ try:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
-    log(f"Loading Stable Diffusion on {{device}}...")
 
     pipe = StableDiffusionPipeline.from_pretrained(
         "runwayml/stable-diffusion-v1-5",
@@ -103,7 +96,6 @@ try:
         safety_checker=None
     )
     pipe = pipe.to(device)
-    log("Model loaded successfully.")
 
     NEGATIVE_PROMPT = "photorealistic, photograph, 3d render, realistic skin, hyperrealism, blurry, low quality, text, watermark"
 
@@ -127,7 +119,6 @@ try:
             num_inference_steps=20, guidance_scale=7.5,
         ).images[0]
         image.save(out_path)
-        log(f"Saved {{fname}}")
 
     shutil.make_archive("/kaggle/working/scene_images_batch", "zip", OUTPUT_DIR)
     log("DONE")
@@ -183,7 +174,7 @@ def get_resume_status(manifest_path, chunk_size=25):
         total_chunks = (len(df) + chunk_size - 1) // chunk_size
         state = _load_state(run_id, manifest_path=manifest_path)
         done = len(state.get("completed_chunks", []))
-        
+
         return {
             "run_id": run_id,
             "manifest_path": state.get("manifest_path", manifest_path),
@@ -270,7 +261,7 @@ def _attempt_chunk_once(chunk_df, kaggle_username, kaggle_key, chunk_index,
 
     dataset_dir = os.path.join(work_dir, "dataset")
     os.makedirs(dataset_dir, exist_ok=True)
-    chunk_df.to_csv(os.path.join(dataset_dir, "scene_manifest.csv"), index=False, encoding='utf-8')
+    chunk_df.to_csv(os.path.join(dataset_dir, "scene_manifest.csv"), index=False, encoding="utf-8")
     with open(os.path.join(dataset_dir, "dataset-metadata.json"), "w") as f:
         json.dump({"title": dataset_slug_name, "id": dataset_slug, "licenses": [{"name": "CC0-1.0"}]}, f)
     _run_kaggle_cli(["datasets", "create", "-p", dataset_dir, "-q"], env)
@@ -365,7 +356,7 @@ def _run_single_chunk(chunk_df, kaggle_username, kaggle_key, chunk_index,
 
 def run_image_generation_chunked(manifest_path, kaggle_username, kaggle_key,
                                   chunk_size=25, progress_callback=None):
-    # Runs the sanitizer first to enforce 'scene_id' and 'prompt' presence
+    # Enforce manifest fixes BEFORE chunking or running execution state checks
     df = load_and_fix_manifest(manifest_path)
 
     run_id = compute_run_id(manifest_path)
