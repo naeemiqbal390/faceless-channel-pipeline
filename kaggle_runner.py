@@ -254,8 +254,8 @@ def _attempt_chunk_once(chunk_df, kaggle_username, kaggle_key, chunk_index,
     # slower attachment-index layer. Grows on retry in case one buffer
     # length still isn't enough for a given run.
     extra_buffer_s = 45 * attempt_number
-    log(f"Chunk {chunk_index}, attempt {attempt_number}: dataset downloadable, "
-        f"waiting {extra_buffer_s}s extra for kernel-attachment indexing...")
+    print(f"Chunk {chunk_index}, attempt {attempt_number}: dataset downloadable, "
+          f"waiting {extra_buffer_s}s extra for kernel-attachment indexing...")
     time.sleep(extra_buffer_s)
 
     kernel_dir = os.path.join(work_dir, "kernel")
@@ -340,8 +340,8 @@ def _run_single_chunk(chunk_df, kaggle_username, kaggle_key, chunk_index,
         except _ChunkAttemptError as e:
             last_error = e
             if attempt < max_attempts and _is_manifest_not_found_signature(e.log_tail):
-                log(f"Chunk {chunk_index}, attempt {attempt}: hit the known dataset-indexing "
-                    f"delay signature — retrying with a longer buffer (attempt {attempt + 1}/{max_attempts}).")
+                print(f"Chunk {chunk_index}, attempt {attempt}: hit the known dataset-indexing "
+                      f"delay signature — retrying with a longer buffer (attempt {attempt + 1}/{max_attempts}).")
                 continue
             raise RuntimeError(str(e))
 
