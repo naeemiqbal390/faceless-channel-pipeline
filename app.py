@@ -1,15 +1,5 @@
 """
-app.py — Streamlit version, deployable free on Streamlit Community Cloud.
-
-ZERO COST version: no Claude API calls anywhere in this app. Titles and
-scripts are written in chat (free, part of normal Claude usage) and pasted
-in here as a starting point. The app itself only ever calls genuinely free
-services: edge-tts, local Whisper, and Kaggle's free GPU.
-
-Required secrets (set in Streamlit Cloud: App settings -> Secrets):
-  KAGGLE_USERNAME
-  KAGGLE_KEY
-(No Anthropic key needed — nothing in this app calls Claude.)
+app.py — Streamlit version with full state safety for file uploads.
 """
 
 import os
@@ -38,7 +28,7 @@ def get_secret(key, override=""):
 
 
 # ============================================================
-# Core logic functions (unchanged from the Gradio version)
+# Core logic functions
 # ============================================================
 
 def generate_audio_file(script_text, voice, progress_callback=None, scenes_per_chunk=7):
@@ -46,9 +36,6 @@ def generate_audio_file(script_text, voice, progress_callback=None, scenes_per_c
     if not scenes:
         raise ValueError("No [SCENE N: ...] markers found — check the script has them.")
 
-    # Group scenes into chunks (not one-per-scene) to preserve natural
-    # prosody within each chunk — too-small chunks make speech sound choppy
-    # at every boundary.
     chunks = [scenes[i:i + scenes_per_chunk] for i in range(0, len(scenes), scenes_per_chunk)]
     total_chunks = len(chunks)
 
@@ -71,7 +58,6 @@ def generate_audio_file(script_text, voice, progress_callback=None, scenes_per_c
         if progress_callback:
             progress_callback(i + 1, total_chunks)
 
-    # Concatenate chunk audio files into one final file
     out_path = os.path.join(tempfile.gettempdir(), "narration.mp3")
     with open(out_path, "wb") as outfile:
         for cp in chunk_paths:
@@ -160,6 +146,10 @@ st.set_page_config(page_title="Faceless Channel Pipeline", layout="wide")
 st.title("Faceless Channel Pipeline")
 st.caption("Stick-figure style · unlimited characters · zero cost")
 
+# Ensure keys exist safely in session state
+if "manifest_path" not in st.session_state:
+    st.session_state["manifest_path"] = None
+
 tab0, tab3, tab4, tab5 = st.tabs(
     ["1. Paste script", "2. Audio", "3. Align", "4. Images"])
 
@@ -189,7 +179,7 @@ with tab0:
     voice_auto = st.selectbox("Voice", EDGE_TTS_VOICES, key="voice_auto")
     kaggle_user_auto = st.text_input("Kaggle username (leave blank if set in Secrets)", key="ku_auto")
     kaggle_key_auto = st.text_input("Kaggle API key (leave blank if set in Secrets)", type="password", key="kk_auto")
-if col_b.button("Run full pipeline", type="primary"):
+    if col_b.button("Run full pipeline", type="primary"):
         if "[SCENE" not in pasted_script:
             st.warning("No [SCENE N: ...] markers found — check you pasted the full script.")
         else:
@@ -226,10 +216,9 @@ if col_b.button("Run full pipeline", type="primary"):
                 kaggle_user = get_secret("KAGGLE_USERNAME", kaggle_user_auto)
                 kaggle_key = get_secret("KAGGLE_KEY", kaggle_key_auto)
                 
-                # Check that manifest_path exists in session state before calling
-                active_manifest = st.session_state.get("manifest_path", None)
-                if not active_manifest:
-                    raise ValueError("Manifest file was not created properly during alignment step.")
+                active_manifest = st.session_state.get("manifest_path")
+                if not active_manifest or not os.path.exists(active_manifest):
+                    raise ValueError("No valid manifest file was found.")
 
                 zip_path = run_image_generation_chunked(active_manifest, kaggle_user, kaggle_key,
                                                           progress_callback=on_image_progress)
@@ -239,7 +228,7 @@ if col_b.button("Run full pipeline", type="primary"):
                     st.download_button("Download scene_images_batch.zip", f, file_name="scene_images_batch.zip")
             except Exception as e:
                 st.error(f"Pipeline stopped at an error: {e}")
-                st.info("Progress up to the last completed step/chunk is saved — click 'Run full pipeline' again to resume rather than restart.")
+                st.info("Progress up to the last completed step/chunk is saved.")
 
 with tab3:
     default_script = st.session_state.get("script_text", "")
@@ -270,8 +259,8 @@ with tab4:
     default_script2 = st.session_state.get("script_text", "")
     script_for_align = st.text_area("Script (auto-filled from step 1)", default_script2, height=300, key="align_script")
     if "audio_path" in st.session_state:
-        st.info("Using the audio generated in step 2 automatically. Upload a different file below only if you want to override it.")
-    uploaded_audio = st.file_uploader("Finished audio (optional — auto-used from step 2 if you skip this)", type=["mp3", "wav"])
+        st.info("Using the audio generated in step 2 automatically.")
+    uploaded_audio = st.file_uploader("Finished audio (optional)", type=["mp3", "wav"])
     if st.button("Generate scene manifest", type="primary"):
         if not uploaded_audio and "audio_path" not in st.session_state:
             st.warning("Upload an audio file, or generate one in the Audio tab first.")
@@ -291,20 +280,25 @@ with tab4:
                         st.download_button("Download scene_manifest.csv", f, file_name="scene_manifest.csv")
                 except Exception as e:
                     st.error(f"Alignment failed: {e}")
-with tab5:
-    uploaded_manifest = st.file_uploader("scene_manifest.csv (optional — auto-used from step 3 if you skip this)", type=["csv"], key="tab5_uploader")
 
-    # If user uploads a file directly in this tab, write it to temp storage and save path in session_state
+with tab5:
+    uploaded_manifest = st.file_uploader(
+        "scene_manifest.csv (optional — auto-used from step 3 if you skip this)", 
+        type=["csv"], 
+        key="tab5_uploader"
+    )
+
+    # Immediately process uploaded file and store in session_state safely
     if uploaded_manifest is not None:
         temp_manifest_path = os.path.join(tempfile.gettempdir(), "uploaded_scene_manifest.csv")
         with open(temp_manifest_path, "wb") as f:
             f.write(uploaded_manifest.getvalue())
         st.session_state["manifest_path"] = temp_manifest_path
 
-    active_manifest_path = st.session_state.get("manifest_path", None)
+    active_manifest_path = st.session_state.get("manifest_path")
 
     if active_manifest_path and os.path.exists(active_manifest_path):
-        st.info(f"Loaded manifest: {os.path.basename(active_manifest_path)}")
+        st.info(f"Loaded manifest ready: {os.path.basename(active_manifest_path)}")
 
     kaggle_user_override = st.text_input("Kaggle username (leave blank if set in Secrets)", key="tab5_user")
     kaggle_key_override = st.text_input("Kaggle API key (leave blank if set in Secrets)", type="password", key="tab5_key")
@@ -324,7 +318,7 @@ with tab5:
         except Exception:
             pass
 
-    button_label = "Resume image generation" if resume_info and resume_info["has_progress"] else "Generate images"
+    button_label = "Resume image generation" if resume_info and resume_info.get("has_progress") else "Generate images"
 
     if st.button(button_label, type="primary", key="btn_gen_images"):
         if not active_manifest_path or not os.path.exists(active_manifest_path):
