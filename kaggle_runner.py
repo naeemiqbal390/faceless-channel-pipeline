@@ -58,7 +58,7 @@ try:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
-    log(f"Loading Stable Diffusion on {device}...")
+    log(f"Loading Stable Diffusion on {{device}}...")
 
     pipe = StableDiffusionPipeline.from_pretrained(
         "runwayml/stable-diffusion-v1-5",
@@ -85,7 +85,7 @@ try:
             num_inference_steps=20, guidance_scale=7.5,
         ).images[0]
         image.save(out_path)
-        log(f"Saved {fname}")
+        log(f"Saved {{fname}}")
 
     shutil.make_archive("/kaggle/working/scene_images_batch", "zip", OUTPUT_DIR)
     log("DONE")
