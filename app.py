@@ -288,25 +288,27 @@ with tab4:
                     st.error(f"Alignment failed: {e}")
 
 with tab5:
+    # 1. Store uploaded CSV into session state immediately if provided
+    uploaded_manifest = st.file_uploader(
+        "scene_manifest.csv (optional — auto-used from step 3 if you skip this)", 
+        type=["csv"], 
+        key="tab5_uploader"
+    )
+
+    if uploaded_manifest is not None:
+        temp_manifest_path = os.path.join(tempfile.gettempdir(), "uploaded_scene_manifest.csv")
+        with open(temp_manifest_path, "wb") as f:
+            f.write(uploaded_manifest.getvalue())
+        st.session_state["manifest_path"] = temp_manifest_path
+
     has_saved_manifest = "manifest_path" in st.session_state
     if has_saved_manifest:
-        st.info("Using the scene manifest from step 3 automatically. Upload a different one below only if you want to override it.")
-    
-    uploaded_manifest = st.file_uploader("scene_manifest.csv (optional — auto-used from step 3 if you skip this)", type=["csv"], key="tab5_uploader")
+        st.info("Scene manifest loaded and ready.")
+
     kaggle_user_override = st.text_input("Kaggle username (leave blank if set in Secrets)", key="tab5_user")
     kaggle_key_override = st.text_input("Kaggle API key (leave blank if set in Secrets)", type="password", key="tab5_key")
 
-    # Determine the active manifest path safely
-    active_manifest_path = None
-
-    if uploaded_manifest is not None:
-        # Save uploaded file to a temporary location
-        temp_path = os.path.join(tempfile.gettempdir(), "uploaded_scene_manifest.csv")
-        with open(temp_path, "wb") as f:
-            f.write(uploaded_manifest.getvalue())
-        active_manifest_path = temp_path
-    elif has_saved_manifest:
-        active_manifest_path = st.session_state["manifest_path"]
+    active_manifest_path = st.session_state.get("manifest_path", None)
 
     resume_info = None
     if active_manifest_path and os.path.exists(active_manifest_path):
@@ -326,7 +328,7 @@ with tab5:
     button_label = "Resume image generation" if resume_info and resume_info["has_progress"] else "Generate images"
 
     if st.button(button_label, type="primary", key="btn_gen_images"):
-        if not active_manifest_path:
+        if not active_manifest_path or not os.path.exists(active_manifest_path):
             st.warning("No manifest found — run step 3 (Align) first, or upload a scene_manifest.csv here.")
         else:
             from kaggle_runner import run_image_generation_chunked
