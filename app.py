@@ -19,7 +19,10 @@ import pandas as pd
 
 def force_fix_manifest_csv(csv_path):
     """Ensures 'scene_id' and 'prompt' columns strictly exist regardless of input format."""
-    df = pd.read_csv(csv_path)
+    try:
+        df = pd.read_csv(csv_path, encoding='utf-8-sig')
+    except Exception:
+        df = pd.read_csv(csv_path)
     
     # Clean whitespace, hidden characters, and lowercase everything
     df.columns = df.columns.astype(str).str.strip().str.replace('\ufeff', '').str.lower()
@@ -27,22 +30,22 @@ def force_fix_manifest_csv(csv_path):
     # Rename common variations to standard schema
     rename_dict = {}
     for col in df.columns:
-        if col in ['scene', 'scene id', 'scene_number', 'id', 'sn']:
+        if col in ['scene', 'scene id', 'scene_number', 'id', 'sn', 'unnamed: 0']:
             rename_dict[col] = 'scene_id'
-        elif col in ['prompts', 'image_prompt', 'scene_prompt', 'description']:
+        elif col in ['prompts', 'image_prompt', 'scene_prompt', 'description', 'text']:
             rename_dict[col] = 'prompt'
             
     if rename_dict:
         df.rename(columns=rename_dict, inplace=True)
         
-    # Fallback: If scene_id is still missing, generate sequential IDs from row index
+    # Fallback: If scene_id is missing, generate sequential IDs from index
     if 'scene_id' not in df.columns:
         df['scene_id'] = list(range(1, len(df) + 1))
         
     if 'prompt' not in df.columns:
         df['prompt'] = "stick figure drawing"
         
-    df.to_csv(csv_path, index=False)
+    df.to_csv(csv_path, index=False, encoding='utf-8')
     return csv_path
 
 
@@ -59,9 +62,6 @@ EDGE_TTS_VOICES = [
 
 
 def get_secret(key_name, user_input=""):
-    """
-    Safely retrieves secrets from Streamlit secrets or form input fallback.
-    """
     if user_input and user_input.strip():
         return user_input.strip()
     try:
@@ -195,7 +195,6 @@ st.set_page_config(page_title="Faceless Channel Pipeline", layout="wide")
 st.title("Faceless Channel Pipeline")
 st.caption("Stick-figure style · unlimited characters · zero cost")
 
-# Ensure state keys exist safely
 if "manifest_path" not in st.session_state:
     st.session_state["manifest_path"] = None
 
