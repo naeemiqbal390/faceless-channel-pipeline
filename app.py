@@ -1,8 +1,6 @@
 """
 app.py
-
-Streamlit web UI for the Faceless Channel Pipeline.
-Automates TTS audio generation, Whisper alignment to CSV manifest, and Kaggle execution.
+Streamlit Web Application UI
 """
 
 import os
@@ -18,38 +16,34 @@ import pandas as pd
 
 
 def force_fix_manifest_csv(csv_path):
-    """Ensures 'scene_id' and 'prompt' columns strictly exist regardless of input format."""
+    """Guarantees schema normalization directly prior to triggering background execution."""
     try:
-        df = pd.read_csv(csv_path, encoding='utf-8-sig')
+        df = pd.read_csv(csv_path, encoding="utf-8-sig")
     except Exception:
         df = pd.read_csv(csv_path)
-    
-    # Clean whitespace, hidden characters, and lowercase everything
-    df.columns = df.columns.astype(str).str.strip().str.replace('\ufeff', '').str.lower()
-    
-    # Rename common variations to standard schema
+
+    df.columns = df.columns.astype(str).str.strip().str.replace("\ufeff", "").str.lower()
+
     rename_dict = {}
     for col in df.columns:
-        if col in ['scene', 'scene id', 'scene_number', 'id', 'sn', 'unnamed: 0']:
-            rename_dict[col] = 'scene_id'
-        elif col in ['prompts', 'image_prompt', 'scene_prompt', 'description', 'text']:
-            rename_dict[col] = 'prompt'
-            
+        if col in ["scene", "scene id", "scene_number", "id", "sn", "unnamed: 0"]:
+            rename_dict[col] = "scene_id"
+        elif col in ["prompts", "image_prompt", "scene_prompt", "description", "text"]:
+            rename_dict[col] = "prompt"
+
     if rename_dict:
         df.rename(columns=rename_dict, inplace=True)
-        
-    # Fallback: If scene_id is missing, generate sequential IDs from index
-    if 'scene_id' not in df.columns:
-        df['scene_id'] = list(range(1, len(df) + 1))
-        
-    if 'prompt' not in df.columns:
-        df['prompt'] = "stick figure drawing"
-        
-    df.to_csv(csv_path, index=False, encoding='utf-8')
+
+    if "scene_id" not in df.columns:
+        df["scene_id"] = list(range(1, len(df) + 1))
+
+    if "prompt" not in df.columns:
+        df["prompt"] = "stick figure drawing"
+
+    df.to_csv(csv_path, index=False, encoding="utf-8")
     return csv_path
 
 
-# Voice list for Edge-TTS
 EDGE_TTS_VOICES = [
     "en-US-ChristopherNeural",
     "en-US-GuyNeural",
@@ -70,10 +64,6 @@ def get_secret(key_name, user_input=""):
         return ""
 
 
-# ============================================================
-# Core logic functions
-# ============================================================
-
 def parse_script_scenes(raw):
     pattern = re.compile(r"\[SCENE\s+\d+:\s*(.*?)\]", re.IGNORECASE | re.DOTALL)
     matches = list(pattern.finditer(raw))
@@ -90,7 +80,7 @@ def parse_script_scenes(raw):
 def generate_audio_file(script_text, voice, progress_callback=None, scenes_per_chunk=7):
     scenes = parse_script_scenes(script_text)
     if not scenes:
-        raise ValueError("No [SCENE N: ...] markers found — check the script has them.")
+        raise ValueError("No [SCENE N: ...] markers found — check script input.")
 
     chunks = [scenes[i:i + scenes_per_chunk] for i in range(0, len(scenes), scenes_per_chunk)]
     total_chunks = len(chunks)
@@ -126,7 +116,7 @@ def generate_audio_file(script_text, voice, progress_callback=None, scenes_per_c
 def align_script_to_audio_file(script_text, audio_path):
     scenes = parse_script_scenes(script_text)
     if not scenes:
-        raise ValueError("No [SCENE N: ...] markers found in the script.")
+        raise ValueError("No [SCENE N: ...] markers found in script.")
 
     from faster_whisper import WhisperModel
     model = WhisperModel("small", device="cpu", compute_type="int8")
@@ -152,7 +142,7 @@ def align_script_to_audio_file(script_text, audio_path):
         window = plain_words[cursor:window_end]
         matcher = SequenceMatcher(None, window, target_words)
         match = matcher.find_longest_match(0, len(window), 0, len(target_words))
-        
+
         if match.size == 0:
             span_len = min(len(target_words), len(window)) or 1
             start_idx = cursor
@@ -164,7 +154,7 @@ def align_script_to_audio_file(script_text, audio_path):
 
         start_idx = max(0, min(start_idx, len(whisper_words) - 1))
         end_idx = max(start_idx, min(end_idx, len(whisper_words) - 1))
-        
+
         scene["start_time"] = whisper_words[start_idx]["start"]
         scene["end_time"] = whisper_words[end_idx]["end"]
         cursor = end_idx + 1
@@ -186,50 +176,38 @@ def align_script_to_audio_file(script_text, audio_path):
     return out_path, len(scenes)
 
 
-# ============================================================
-# Streamlit UI
-# ============================================================
-
+# Interface setup
 st.set_page_config(page_title="Faceless Channel Pipeline", layout="wide")
-
 st.title("Faceless Channel Pipeline")
 st.caption("Stick-figure style · unlimited characters · zero cost")
 
 if "manifest_path" not in st.session_state:
     st.session_state["manifest_path"] = None
 
-tab0, tab3, tab4, tab5 = st.tabs(
-    ["1. Paste script", "2. Audio", "3. Align", "4. Images"])
+tab0, tab3, tab4, tab5 = st.tabs(["1. Paste script", "2. Audio", "3. Align", "4. Images"])
 
 with tab0:
-    st.markdown(
-        "Titles and scripts are written in chat (free) — see your Claude "
-        "conversation, following the project rulebook. Paste the finished "
-        "script here to start the pipeline."
-    )
-    pasted_script = st.text_area(
-        "Script (must use [SCENE N: prompt] markers, as written in chat)",
-        st.session_state.get("script_text", ""), height=400)
+    st.markdown("Paste the finished script here to start the automated workflow.")
+    pasted_script = st.text_area("Script", st.session_state.get("script_text", ""), height=400)
     col_a, col_b = st.columns(2)
     if col_a.button("Save script", type="primary"):
         if "[SCENE" not in pasted_script:
-            st.warning("No [SCENE N: ...] markers found — check you pasted the full script.")
+            st.warning("No [SCENE N: ...] markers found in script input.")
         else:
             st.session_state["script_text"] = pasted_script
             scene_count = len(re.findall(r"\[SCENE", pasted_script))
             narration_only = re.sub(r"\[SCENE.*?\]\n?", "", pasted_script, flags=re.DOTALL)
             word_count = len(re.findall(r"\S+", narration_only))
-            st.success(f"Saved — {scene_count} scenes, ~{word_count} words, "
-                       f"~{word_count/135:.1f} min estimated.")
+            st.success(f"Saved — {scene_count} scenes, ~{word_count} words.")
 
     st.divider()
-    st.markdown("**Or run the whole thing in one click** (audio → align → images), using the settings below.")
     voice_auto = st.selectbox("Voice", EDGE_TTS_VOICES, key="voice_auto")
-    kaggle_user_auto = st.text_input("Kaggle username (leave blank if set in Secrets)", key="ku_auto")
-    kaggle_key_auto = st.text_input("Kaggle API key (leave blank if set in Secrets)", type="password", key="kk_auto")
+    kaggle_user_auto = st.text_input("Kaggle username (or leave blank if set in Secrets)", key="ku_auto")
+    kaggle_key_auto = st.text_input("Kaggle API key (or leave blank if set in Secrets)", type="password", key="kk_auto")
+
     if col_b.button("Run full pipeline", type="primary"):
         if "[SCENE" not in pasted_script:
-            st.warning("No [SCENE N: ...] markers found — check you pasted the full script.")
+            st.warning("No [SCENE N: ...] markers found.")
         else:
             st.session_state["script_text"] = pasted_script
             try:
@@ -244,12 +222,10 @@ with tab0:
                 audio_path = generate_audio_file(pasted_script, voice_auto, progress_callback=on_audio_progress)
                 st.session_state["audio_path"] = audio_path
                 audio_bar.progress(1.0)
-                st.success("Audio done.")
 
-                with st.spinner("Step 2/3 — aligning to get timestamps..."):
+                with st.spinner("Step 2/3 — aligning..."):
                     manifest_path, n_scenes = align_script_to_audio_file(pasted_script, audio_path)
                     st.session_state["manifest_path"] = manifest_path
-                st.success(f"Aligned {n_scenes} scenes.")
 
                 st.markdown("**Step 3/3 — images**")
                 image_bar = st.progress(0.0)
@@ -263,10 +239,10 @@ with tab0:
                 from kaggle_runner import run_image_generation_chunked
                 kaggle_user = get_secret("KAGGLE_USERNAME", kaggle_user_auto)
                 kaggle_key = get_secret("KAGGLE_KEY", kaggle_key_auto)
-                
+
                 active_manifest = st.session_state.get("manifest_path")
                 if not active_manifest or not os.path.exists(active_manifest):
-                    raise ValueError("No valid manifest file was found.")
+                    raise ValueError("Manifest path unresolved or non-existent.")
 
                 force_fix_manifest_csv(active_manifest)
 
@@ -277,15 +253,11 @@ with tab0:
                 with open(zip_path, "rb") as f:
                     st.download_button("Download scene_images_batch.zip", f, file_name="scene_images_batch.zip")
             except Exception as e:
-                st.error(f"Pipeline stopped at an error: {e}")
-                st.info("Progress up to the last completed step/chunk is saved.")
+                st.error(f"Pipeline stopped: {e}")
 
 with tab3:
     default_script = st.session_state.get("script_text", "")
-    if default_script:
-        st.info("Using the script saved in step 1 automatically.")
-    script_for_audio = st.text_area("Script (auto-filled from step 1)",
-                                     default_script, height=300, key="audio_script")
+    script_for_audio = st.text_area("Script", default_script, height=300, key="audio_script")
     voice = st.selectbox("Voice", EDGE_TTS_VOICES)
     if st.button("Generate audio", type="primary"):
         progress_bar = st.progress(0.0)
@@ -299,7 +271,7 @@ with tab3:
             path = generate_audio_file(script_for_audio, voice, progress_callback=on_audio_progress)
             st.session_state["audio_path"] = path
             progress_bar.progress(1.0)
-            st.success(f"Audio generated with voice {voice}.")
+            st.success("Audio generated.")
         except Exception as e:
             st.error(f"Audio generation failed: {e}")
     if "audio_path" in st.session_state:
@@ -307,15 +279,13 @@ with tab3:
 
 with tab4:
     default_script2 = st.session_state.get("script_text", "")
-    script_for_align = st.text_area("Script (auto-filled from step 1)", default_script2, height=300, key="align_script")
-    if "audio_path" in st.session_state:
-        st.info("Using the audio generated in step 2 automatically.")
+    script_for_align = st.text_area("Script", default_script2, height=300, key="align_script")
     uploaded_audio = st.file_uploader("Finished audio (optional)", type=["mp3", "wav"])
     if st.button("Generate scene manifest", type="primary"):
         if not uploaded_audio and "audio_path" not in st.session_state:
-            st.warning("Upload an audio file, or generate one in the Audio tab first.")
+            st.warning("Generate or upload audio first.")
         else:
-            with st.spinner("Aligning (this can take a minute)..."):
+            with st.spinner("Aligning..."):
                 try:
                     if uploaded_audio:
                         audio_path = os.path.join(tempfile.gettempdir(), "uploaded_audio")
@@ -333,12 +303,8 @@ with tab4:
 
 with tab5:
     st.markdown("### Generate Images on Kaggle")
-    
-    uploaded_manifest = st.file_uploader(
-        "scene_manifest.csv (optional — auto-used from step 3 if skipped)", 
-        type=["csv"], 
-        key="tab5_uploader"
-    )
+
+    uploaded_manifest = st.file_uploader("scene_manifest.csv (optional)", type=["csv"], key="tab5_uploader")
 
     if uploaded_manifest is not None:
         temp_manifest_path = os.path.join(tempfile.gettempdir(), "scene_manifest.csv")
@@ -358,21 +324,21 @@ with tab5:
         except Exception:
             pass
     else:
-        st.warning("No active manifest found. Upload a CSV manifest above or run Alignment in step 3.")
+        st.warning("No active manifest found. Upload or generate a CSV manifest.")
 
-    kaggle_user_override = st.text_input("Kaggle username (leave blank if set in Secrets)", key="tab5_user")
-    kaggle_key_override = st.text_input("Kaggle API key (leave blank if set in Secrets)", type="password", key="tab5_key")
+    kaggle_user_override = st.text_input("Kaggle username (optional)", key="tab5_user")
+    kaggle_key_override = st.text_input("Kaggle API key (optional)", type="password", key="tab5_key")
 
     if st.button("Generate Images on Kaggle", type="primary"):
         if not active_manifest_path or not os.path.exists(active_manifest_path):
-            st.error("Missing manifest file! Please upload a CSV or complete step 3.")
+            st.error("Missing manifest file! Please upload a CSV or run alignment.")
         else:
             try:
                 kaggle_user = get_secret("KAGGLE_USERNAME", kaggle_user_override)
                 kaggle_key = get_secret("KAGGLE_KEY", kaggle_key_override)
-                
+
                 if not kaggle_user or not kaggle_key:
-                    st.error("Kaggle credentials missing. Enter username & key above or add to Secrets.")
+                    st.error("Kaggle credentials missing.")
                 else:
                     image_bar = st.progress(0.0)
                     image_status = st.empty()
@@ -383,23 +349,22 @@ with tab5:
                         image_status.markdown(f"**{done_images}/{total_images} images** — {message}")
 
                     from kaggle_runner import run_image_generation_chunked
-                    
-                    # Sanitize CSV before handing off
+
                     force_fix_manifest_csv(active_manifest_path)
 
                     zip_path = run_image_generation_chunked(
-                        active_manifest_path, 
-                        kaggle_user, 
+                        active_manifest_path,
+                        kaggle_user,
                         kaggle_key,
                         progress_callback=on_image_progress
                     )
-                    
+
                     image_bar.progress(1.0)
                     st.success("All images generated successfully!")
                     with open(zip_path, "rb") as f:
                         st.download_button(
-                            "Download scene_images_batch.zip", 
-                            f, 
+                            "Download scene_images_batch.zip",
+                            f,
                             file_name="scene_images_batch.zip",
                             mime="application/zip"
                         )
