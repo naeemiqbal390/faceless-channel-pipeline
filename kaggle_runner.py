@@ -50,14 +50,15 @@ def load_and_fix_manifest(csv_path):
 
     # Hard Fallback: Auto-inject scene_id if completely missing
     if 'scene_id' not in df.columns:
-        df['scene_id'] = range(1, len(df) + 1)
+        df['scene_id'] = list(range(1, len(df) + 1))
 
     # Hard Fallback: Auto-inject default prompt if missing
     if 'prompt' not in df.columns:
         df['prompt'] = "stick figure drawing"
 
-    # Ensure scene_id is integer-based
-    df['scene_id'] = pd.to_numeric(df['scene_id'], errors='coerce').fillna(range(1, len(df) + 1)).astype(int)
+    # Ensure scene_id is integer-based safely (FIXED: Converts range to Series matching index)
+    fallback_series = pd.Series(range(1, len(df) + 1), index=df.index)
+    df['scene_id'] = pd.to_numeric(df['scene_id'], errors='coerce').fillna(fallback_series).astype(int)
     
     # Save clean copy over the file
     df.to_csv(csv_path, index=False, encoding='utf-8')
