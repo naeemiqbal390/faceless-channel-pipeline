@@ -1,5 +1,5 @@
 """
-app.py — Streamlit version with full state safety for file uploads.
+app.py — Fully audited version with complete state safety and CSV path standardization.
 """
 
 import os
@@ -19,12 +19,15 @@ EDGE_TTS_VOICES = [
 
 
 def get_secret(key, override=""):
-    if override.strip():
-        return override.strip()
+    if override and str(override).strip():
+        return str(override).strip()
     try:
-        return st.secrets.get(key, "")
+        val = st.secrets.get(key, "")
+        if val:
+            return str(val).strip()
     except Exception:
-        return os.environ.get(key, "")
+        pass
+    return os.environ.get(key, "").strip()
 
 
 # ============================================================
@@ -146,7 +149,7 @@ st.set_page_config(page_title="Faceless Channel Pipeline", layout="wide")
 st.title("Faceless Channel Pipeline")
 st.caption("Stick-figure style · unlimited characters · zero cost")
 
-# Ensure keys exist safely in session state
+# Safely initialize session state
 if "manifest_path" not in st.session_state:
     st.session_state["manifest_path"] = None
 
@@ -216,6 +219,9 @@ with tab0:
                 kaggle_user = get_secret("KAGGLE_USERNAME", kaggle_user_auto)
                 kaggle_key = get_secret("KAGGLE_KEY", kaggle_key_auto)
                 
+                if not kaggle_user or not kaggle_key:
+                    raise ValueError("Missing Kaggle Credentials! Check your username and API key.")
+
                 active_manifest = st.session_state.get("manifest_path")
                 if not active_manifest or not os.path.exists(active_manifest):
                     raise ValueError("No valid manifest file was found.")
@@ -288,9 +294,9 @@ with tab5:
         key="tab5_uploader"
     )
 
-    # Immediately process uploaded file and store in session_state safely
+    # Always standardize file name to scene_manifest.csv for Kaggle compatibility
     if uploaded_manifest is not None:
-        temp_manifest_path = os.path.join(tempfile.gettempdir(), "uploaded_scene_manifest.csv")
+        temp_manifest_path = os.path.join(tempfile.gettempdir(), "scene_manifest.csv")
         with open(temp_manifest_path, "wb") as f:
             f.write(uploaded_manifest.getvalue())
         st.session_state["manifest_path"] = temp_manifest_path
@@ -308,17 +314,21 @@ with tab5:
         from kaggle_runner import get_resume_status
         try:
             resume_info = get_resume_status(active_manifest_path)
-            if resume_info["has_progress"]:
+            if isinstance(resume_info, dict) and resume_info.get("has_progress", False):
+                done_c = resume_info.get("done_chunks", 0)
+                tot_c = resume_info.get("total_chunks", 0)
+                tot_i = resume_info.get("total_images", 0)
                 st.warning(
                     f"Found saved progress for this manifest: "
-                    f"{resume_info['done_chunks']}/{resume_info['total_chunks']} chunks "
-                    f"(~{resume_info['done_chunks'] * 25} of {resume_info['total_images']} images) already done. "
+                    f"{done_c}/{tot_c} chunks "
+                    f"(~{done_c * 25} of {tot_i} images) already done. "
                     f"Clicking the button below will resume, not restart."
                 )
         except Exception:
-            pass
+            resume_info = None
 
-    button_label = "Resume image generation" if resume_info and resume_info.get("has_progress") else "Generate images"
+    has_prog = bool(resume_info and isinstance(resume_info, dict) and resume_info.get("has_progress"))
+    button_label = "Resume image generation" if has_prog else "Generate images"
 
     if st.button(button_label, type="primary", key="btn_gen_images"):
         if not active_manifest_path or not os.path.exists(active_manifest_path):
