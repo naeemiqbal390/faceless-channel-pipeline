@@ -4,20 +4,6 @@ kaggle_runner.py
 Handles talking to Kaggle's API on the user's behalf, split into CHUNKS so
 the app can show real, exact progress and genuinely resume after an
 interruption — rather than one opaque black-box run with no visibility.
-
-Why chunked: Kaggle's API doesn't reliably expose file-by-file progress
-from a kernel while it's still running, so a single big run can't report
-real live percentages. Running in chunks (e.g. 25 images at a time) means
-the app knows exactly how many chunks are done, and can resume from the
-next unfinished one — a real checkpoint, not a guess.
-
-Resume persistence: progress is saved to disk at
-/tmp/pipeline_runs/{run_id}/state.json plus each chunk's downloaded zip.
-This survives the browser closing/reopening within the same running app
-session. It does NOT survive a full app reboot/redeploy on Streamlit Cloud
-(that wipes disk) — for that level of safety, download each chunk's
-partial zip as it completes, so you always have a real backup on your own
-machine regardless of what happens to the server.
 """
 
 import os
@@ -105,48 +91,65 @@ def _run_kaggle_cli(args, env):
 def compute_run_id(manifest_path):
     """A stable ID derived from the manifest's content, so resuming the
     same video's manifest always finds the same saved progress."""
-    with open(manifest_path, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()[:16]
+    try:
+        with open(manifest_path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except Exception:
+        return "default_run"
 
 
-def _load_state(run_id):
+def _load_state(run_id, manifest_path=""):
     state_path = os.path.join(RUNS_DIR, run_id, "state.json")
     if os.path.exists(state_path):
-        with open(state_path) as f:
-            return json.load(f)
-    return {"completed_chunks": []}
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+                if isinstance(state, dict):
+                    return state
+        except Exception:
+            pass
+    return {"completed_chunks": [], "manifest_path": manifest_path}
 
 
 def _save_state(run_id, state):
     run_dir = os.path.join(RUNS_DIR, run_id)
     os.makedirs(run_dir, exist_ok=True)
-    with open(os.path.join(run_dir, "state.json"), "w") as f:
-        json.dump(state, f)
+    try:
+        with open(os.path.join(run_dir, "state.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
 
 
 def get_resume_status(manifest_path, chunk_size=25):
-    """Check if there's existing progress for this exact manifest."""
-    run_id = compute_run_id(manifest_path)
-    df = pd.read_csv(manifest_path)
-    total_chunks = (len(df) + chunk_size - 1) // chunk_size
-    state = _load_state(run_id)
-    done = len(state.get("completed_chunks", []))
-    return {
-        "run_id": run_id,
-        "total_chunks": total_chunks,
-        "done_chunks": done,
-        "total_images": len(df),
-        "has_progress": done > 0,
-    }
+    """Check if there's existing progress for this exact manifest safely."""
+    try:
+        run_id = compute_run_id(manifest_path)
+        df = pd.read_csv(manifest_path)
+        total_chunks = (len(df) + chunk_size - 1) // chunk_size
+        state = _load_state(run_id, manifest_path=manifest_path)
+        done = len(state.get("completed_chunks", []))
+        
+        return {
+            "run_id": run_id,
+            "manifest_path": state.get("manifest_path", manifest_path),
+            "total_chunks": total_chunks,
+            "done_chunks": done,
+            "total_images": len(df),
+            "has_progress": done > 0,
+        }
+    except Exception:
+        return {
+            "run_id": "",
+            "manifest_path": manifest_path,
+            "total_chunks": 0,
+            "done_chunks": 0,
+            "total_images": 0,
+            "has_progress": False,
+        }
 
 
 def _wait_for_dataset_ready(dataset_slug, env, timeout_s=180, interval_s=10):
-    """Neither `datasets files` (reflects the upload index, not backend
-    processing) nor `datasets status` (not a real kaggle CLI subcommand)
-    are reliable signals here. Actually downloading the file is the
-    strongest available signal, since it exercises the same backend path
-    a kernel's input mount depends on — if the download succeeds, the
-    kernel's mount will too."""
     deadline = time.time() + timeout_s
     check_dir = tempfile.mkdtemp(prefix="ds_ready_check_")
     last_err = ""
@@ -176,9 +179,6 @@ def _wait_for_dataset_ready(dataset_slug, env, timeout_s=180, interval_s=10):
 
 
 def _fetch_kernel_log_tail(kernel_slug, env, max_chars=3000):
-    """Download whatever Kaggle produced for this kernel run and pull out
-    real log/error content, instead of leaving the user with just a status
-    string and a guessed URL."""
     out_dir = tempfile.mkdtemp(prefix="kernel_fail_out_")
     try:
         _run_kaggle_cli(["kernels", "output", kernel_slug, "-p", out_dir], env)
@@ -203,10 +203,6 @@ def _fetch_kernel_log_tail(kernel_slug, env, max_chars=3000):
 
 
 def _is_manifest_not_found_signature(log_tail):
-    """Detects the specific 'kernel started before the dataset was fully
-    attachment-indexed' failure signature, as opposed to some other, real
-    bug in the generation script — only that specific signature is worth
-    automatically retrying."""
     if not log_tail:
         return False
     return "FileNotFoundError" in log_tail and "scene_manifest.csv" in log_tail
@@ -225,14 +221,8 @@ def _attempt_chunk_once(chunk_df, kaggle_username, kaggle_key, chunk_index,
         json.dump({"title": dataset_slug_name, "id": dataset_slug, "licenses": [{"name": "CC0-1.0"}]}, f)
     _run_kaggle_cli(["datasets", "create", "-p", dataset_dir, "-q"], env)
 
-    # Confirms the file is downloadable — necessary but, as observed in
-    # practice, NOT sufficient: the separate index a kernel's
-    # dataset_sources attachment reads from can lag behind this by longer.
     _wait_for_dataset_ready(dataset_slug, env)
 
-    # Extra buffer on top of download-confirmation, specifically for that
-    # slower attachment-index layer. Grows on retry in case one buffer
-    # length still isn't enough for a given run.
     extra_buffer_s = 60 * attempt_number
     print(f"Chunk {chunk_index}, attempt {attempt_number}: dataset downloadable, "
           f"waiting {extra_buffer_s}s extra for kernel-attachment indexing...")
@@ -303,11 +293,6 @@ class _ChunkAttemptError(RuntimeError):
 
 def _run_single_chunk(chunk_df, kaggle_username, kaggle_key, chunk_index,
                        timeout_minutes=25, max_attempts=3):
-    """Wraps a single chunk attempt with automatic retries. Only retries
-    when the failure matches the known 'dataset not yet attachment-indexed'
-    signature — any other kind of failure (a real script bug, quota
-    exhaustion, etc.) fails immediately instead of burning GPU quota on
-    pointless repeat attempts."""
     env = os.environ.copy()
     env["KAGGLE_USERNAME"] = kaggle_username
     env["KAGGLE_KEY"] = kaggle_key
@@ -334,11 +319,6 @@ def run_image_generation_chunked(manifest_path, kaggle_username, kaggle_key,
     Runs image generation in chunks, saving real progress to disk after
     each one. Automatically resumes from the first incomplete chunk if
     called again on the same manifest.
-
-    progress_callback(done_chunks, total_chunks, done_images, total_images, message)
-    is called after each chunk completes, for live UI updates.
-
-    Returns the path to the final combined zip of all images.
     """
     run_id = compute_run_id(manifest_path)
     run_dir = os.path.join(RUNS_DIR, run_id)
@@ -349,7 +329,7 @@ def run_image_generation_chunked(manifest_path, kaggle_username, kaggle_key,
     chunks = [df.iloc[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
     total_chunks = len(chunks)
 
-    state = _load_state(run_id)
+    state = _load_state(run_id, manifest_path=manifest_path)
     completed = set(state.get("completed_chunks", []))
 
     if progress_callback and completed:
@@ -368,6 +348,7 @@ def run_image_generation_chunked(manifest_path, kaggle_username, kaggle_key,
 
         completed.add(i)
         state["completed_chunks"] = sorted(completed)
+        state["manifest_path"] = manifest_path
         _save_state(run_id, state)
 
         done_images = min(len(completed) * chunk_size, total_images)
@@ -375,7 +356,6 @@ def run_image_generation_chunked(manifest_path, kaggle_username, kaggle_key,
             progress_callback(len(completed), total_chunks, done_images, total_images,
                                f"Chunk {i+1}/{total_chunks} done.")
 
-    # Merge all chunk zips into one final zip
     merged_dir = os.path.join(run_dir, "merged")
     os.makedirs(merged_dir, exist_ok=True)
     for i in range(total_chunks):
