@@ -66,7 +66,7 @@ def log(msg):
     print(msg, flush=True)
 
 log("Installing stable diffusion dependencies...")
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "diffusers==0.27.2", "transformers", "accelerate"], check=True)
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "diffusers==0.31.0", "transformers==4.46.3", "accelerate==1.1.0"], check=True)
 
 import pandas as pd
 import torch
@@ -106,7 +106,7 @@ try:
         except (ValueError, TypeError):
             scene_id = idx + 1
 
-        fname = f"scene_{scene_id:03d}.png"
+        fname = f"scene_{{scene_id:03d}}.png"
         out_path = os.path.join(OUTPUT_DIR, fname)
         if os.path.exists(out_path):
             continue
