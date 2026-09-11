@@ -136,7 +136,7 @@ def assemble_video(manifest_path, images_dir, audio_path, output_path, progress_
     cmd_video = [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0", "-i", concat_list_path,
-        "-vsync", "vfr", "-r", "30", "-pix_fmt", "yuv420p",
+        "-r", "30", "-pix_fmt", "yuv420p",
         "-c:v", "libx264",
         silent_video_path,
     ]
