@@ -17,6 +17,7 @@ Kaggle + FLUX.1-schnell pipeline.
 """
 
 import os
+import re
 import time
 import json
 import hashlib
@@ -213,6 +214,13 @@ def _classify_error(err_text):
            ["api_key_invalid", "invalid api key", "unauthenticated", "401",
             "api key not valid"]):
         return "auth_error"
+    # A quota error reporting "limit: 0" means this model has NO free-tier
+    # allocation at all on this key (often a preview model that's still
+    # allowlist-only despite being documented as available) — not a busy
+    # model that'll free up if we wait. No amount of backoff fixes a hard
+    # zero, so treat it the same as model-not-found: switch immediately.
+    if re.search(r"limit['\"]?\s*[:=]\s*0\b", lowered):
+        return "model_unavailable"
     if "429" in err_text or "resource_exhausted" in lowered or "quota" in lowered or "rate" in lowered:
         return "rate_limit"
     if any(tok in lowered for tok in
