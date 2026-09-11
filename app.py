@@ -243,9 +243,9 @@ with tab0:
 
     st.divider()
     voice_auto = st.selectbox("Voice", EDGE_TTS_VOICES, key="voice_auto")
-    gemini_key_auto = st.text_input(
-        "Gemini API key (or leave blank if set in Secrets as GEMINI_API_KEY)",
-        type="password", key="gk_auto",
+    pollinations_token_auto = st.text_input(
+        "Pollinations token (optional — leave blank to use anonymously, or set POLLINATIONS_TOKEN in Secrets)",
+        type="password", key="pk_auto",
     )
 
     if col_b.button("Run full pipeline", type="primary"):
@@ -282,8 +282,8 @@ with tab0:
                     image_bar.progress(min(pct, 1.0))
                     image_log(f"{done_images}/{total_images} images generated — {message}")
 
-                import gemini_runner
-                gemini_key = get_secret("GEMINI_API_KEY", gemini_key_auto)
+                import pollinations_runner
+                pollinations_token = get_secret("POLLINATIONS_TOKEN", pollinations_token_auto)
 
                 active_manifest = st.session_state.get("manifest_path")
                 if not active_manifest or not os.path.exists(active_manifest):
@@ -291,8 +291,8 @@ with tab0:
 
                 force_fix_manifest_csv(active_manifest)
 
-                images_dir, zip_path, failed_scenes = gemini_runner.run_image_generation(
-                    active_manifest, gemini_key, progress_callback=on_image_progress
+                images_dir, zip_path, failed_scenes = pollinations_runner.run_image_generation(
+                    active_manifest, pollinations_token, progress_callback=on_image_progress
                 )
                 st.session_state["images_dir"] = images_dir
                 image_bar.progress(1.0)
@@ -385,10 +385,11 @@ with tab_align:
                     st.error(f"Alignment failed: {e}")
 
 with tab_images:
-    st.markdown("### Generate Images (Gemini)")
-    st.caption("Paces itself dynamically (speeds up on success, backs off on rate limits) instead of a fixed "
-               "rate — a failed scene is parked and auto-retried later without blocking the rest, and it "
-               "automatically falls back to an older model if the newest one isn't available on this key.")
+    st.markdown("### Generate Images (Pollinations.ai)")
+    st.caption("Free, keyless image generation (Flux, falling back to Turbo). Paces itself dynamically instead of "
+               "a fixed rate — a failed scene is parked and auto-retried later without blocking the rest. "
+               "Works anonymously; a free Pollinations account token (no card) raises the rate limit and drops "
+               "the watermark, but isn't required.")
 
     uploaded_manifest = st.file_uploader("scene_manifest.csv (optional)", type=["csv"], key="tab_images_uploader")
 
@@ -402,9 +403,9 @@ with tab_images:
 
     if active_manifest_path and os.path.exists(active_manifest_path):
         st.info(f"Loaded manifest ready: {os.path.basename(active_manifest_path)}")
-        import gemini_runner
+        import pollinations_runner
         try:
-            resume_info = gemini_runner.get_resume_status(active_manifest_path)
+            resume_info = pollinations_runner.get_resume_status(active_manifest_path)
             if resume_info.get("has_progress"):
                 st.success(f"Found saved progress: {resume_info['done_images']}/{resume_info['total_images']} images already done.")
         except Exception:
@@ -412,8 +413,8 @@ with tab_images:
     else:
         st.warning("No active manifest found. Upload or generate a CSV manifest.")
 
-    gemini_key_override = st.text_input(
-        "Gemini API key (optional — or set GEMINI_API_KEY in Secrets)",
+    pollinations_token_override = st.text_input(
+        "Pollinations token (optional — or set POLLINATIONS_TOKEN in Secrets; blank works fine anonymously)",
         type="password", key="tab_images_key",
     )
 
@@ -422,42 +423,39 @@ with tab_images:
             st.error("Missing manifest file! Please upload a CSV or run alignment.")
         else:
             try:
-                gemini_key = get_secret("GEMINI_API_KEY", gemini_key_override)
+                pollinations_token = get_secret("POLLINATIONS_TOKEN", pollinations_token_override)
 
-                if not gemini_key:
-                    st.error("Gemini API key missing.")
+                image_bar = st.progress(0.0)
+                image_status = st.empty()
+                image_log = make_progress_log(image_status)
+
+                def on_image_progress(done_images, total_images, message):
+                    pct = done_images / total_images if total_images else 0
+                    image_bar.progress(min(pct, 1.0))
+                    image_log(f"{done_images}/{total_images} images generated — {message}")
+
+                import pollinations_runner
+
+                force_fix_manifest_csv(active_manifest_path)
+
+                images_dir, zip_path, failed_scenes = pollinations_runner.run_image_generation(
+                    active_manifest_path, pollinations_token, progress_callback=on_image_progress
+                )
+                st.session_state["images_dir"] = images_dir
+
+                image_bar.progress(1.0)
+                if failed_scenes:
+                    st.warning(f"{len(failed_scenes)} scenes failed and were skipped: {failed_scenes}. "
+                               f"Click Generate Images again to retry just those — completed scenes won't be redone.")
                 else:
-                    image_bar = st.progress(0.0)
-                    image_status = st.empty()
-                    image_log = make_progress_log(image_status)
+                    st.success("All images generated successfully!")
 
-                    def on_image_progress(done_images, total_images, message):
-                        pct = done_images / total_images if total_images else 0
-                        image_bar.progress(min(pct, 1.0))
-                        image_log(f"{done_images}/{total_images} images generated — {message}")
-
-                    import gemini_runner
-
-                    force_fix_manifest_csv(active_manifest_path)
-
-                    images_dir, zip_path, failed_scenes = gemini_runner.run_image_generation(
-                        active_manifest_path, gemini_key, progress_callback=on_image_progress
-                    )
-                    st.session_state["images_dir"] = images_dir
-
-                    image_bar.progress(1.0)
-                    if failed_scenes:
-                        st.warning(f"{len(failed_scenes)} scenes failed and were skipped: {failed_scenes}. "
-                                   f"Click Generate Images again to retry just those — completed scenes won't be redone.")
-                    else:
-                        st.success("All images generated successfully!")
-
-                    with open(zip_path, "rb") as f:
-                        st.download_button(
-                            "Download scene_images_batch.zip",
-                            f,
-                            file_name="scene_images_batch.zip",
-                            mime="application/zip"
+                with open(zip_path, "rb") as f:
+                    st.download_button(
+                        "Download scene_images_batch.zip",
+                        f,
+                        file_name="scene_images_batch.zip",
+                        mime="application/zip"
                         )
             except Exception as e:
                 st.error(f"Image generation failed: {e}")
@@ -479,9 +477,9 @@ with tab_video:
             st.session_state["audio_path"] = active_audio_for_video
 
     if active_manifest_for_video and os.path.exists(active_manifest_for_video):
-        import gemini_runner
-        images_dir_for_video = gemini_runner.get_images_dir(active_manifest_for_video)
-        resume_info = gemini_runner.get_resume_status(active_manifest_for_video)
+        import pollinations_runner
+        images_dir_for_video = pollinations_runner.get_images_dir(active_manifest_for_video)
+        resume_info = pollinations_runner.get_resume_status(active_manifest_for_video)
         st.info(f"Images ready: {resume_info['done_images']}/{resume_info['total_images']}")
     else:
         images_dir_for_video = None
