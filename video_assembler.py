@@ -3,21 +3,40 @@ video_assembler.py
 Assembles the final video from generated scene images + narration audio,
 timed against scene_manifest.csv (start_time/end_time columns).
 
-If a scene's image isn't ready yet, its slot is NOT dropped from the
-timeline — dropping it would shrink the video's total length and throw
-every later scene out of sync with the (unchanged) audio track. Instead
-the nearest available neighboring scene's image is reused for that
-duration, and the scene is reported back so it can be swapped in for
-real once its image finishes generating.
+Two design decisions worth knowing about:
 
-Requires the 'ffmpeg' system binary. On Streamlit Community Cloud this means
-adding a packages.txt file (see accompanying packages.txt) so the platform
-apt-installs it before the app starts — it is not bundled with the base image.
+1. GAP FILLING, NOT SKIPPING: if a scene's image isn't ready yet, its slot
+   is NOT dropped from the timeline — dropping it would shrink the video's
+   total length and throw every later scene out of sync with the (unchanged)
+   audio track. Instead the nearest available neighboring scene's image is
+   reused for that duration, and the scene is reported back so the real
+   artwork can be swapped in once it exists.
+
+2. MOTION INSTEAD OF A DURATION CAP: every scene image gets a slow,
+   alternating zoom-in/zoom-out (Ken Burns effect) for its exact narrated
+   duration, rather than capping how long an image can stay on screen.
+   A hard cap (e.g. 5s max) would force the picture to stop matching the
+   narration for whatever's left of that scene — motion solves "boring"
+   without ever breaking audio/video sync.
+
+Also reconciles the total image timeline to the actual narration length
+via ffprobe, so the video is never a hair short or long of the audio.
+
+Requires the 'ffmpeg' and 'ffprobe' system binaries (installed together by
+the same apt package — see packages.txt). Not bundled with the base image
+on Streamlit Community Cloud without it.
 """
 
 import os
 import subprocess
 import tempfile
+
+VIDEO_WIDTH = 1024
+VIDEO_HEIGHT = 1024
+FPS = 30
+
+# How far in/out the Ken Burns effect zooms over a scene's duration.
+MAX_ZOOM = 1.15
 
 
 def _hhmmss_to_seconds(value):
@@ -42,8 +61,8 @@ def _load_manifest_df(manifest_path):
         df = pd.read_csv(manifest_path)
     df.columns = df.columns.astype(str).str.strip().str.replace("\ufeff", "").str.lower()
 
-    # Match gemini_runner's scene_id coercion exactly so both modules agree
-    # on numbering even if the manifest has blank/non-numeric rows.
+    # Match pollinations_runner's scene_id coercion exactly so both modules
+    # agree on numbering even if the manifest has blank/non-numeric rows.
     if "scene_id" in df.columns:
         fallback_series = pd.Series(range(1, len(df) + 1), index=df.index)
         df["scene_id"] = pd.to_numeric(df["scene_id"], errors="coerce").fillna(fallback_series).astype(int)
@@ -51,6 +70,54 @@ def _load_manifest_df(manifest_path):
         df["scene_id"] = list(range(1, len(df) + 1))
 
     return df
+
+
+def _get_audio_duration_seconds(audio_path):
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+            capture_output=True, text=True,
+        )
+        return float(result.stdout.strip())
+    except (ValueError, TypeError, OSError):
+        return None
+
+
+def _render_scene_clip(image_path, duration, output_path, zoom_out):
+    """
+    Renders one scene's image into a short video clip with a slow,
+    continuous zoom (Ken Burns effect) — zooming in for even-indexed
+    scenes, out for odd-indexed ones, so consecutive scenes don't feel
+    repetitive. Kept centered so it never crops off anything important.
+    """
+    duration = max(0.5, duration)
+    frames = max(1, round(duration * FPS))
+    step = (MAX_ZOOM - 1.0) / frames
+
+    if zoom_out:
+        zoom_expr = f"if(eq(on,1),{MAX_ZOOM},max(zoom-{step:.6f},1.0))"
+    else:
+        zoom_expr = f"min(zoom+{step:.6f},{MAX_ZOOM})"
+
+    vf = (
+        f"zoompan=z='{zoom_expr}':d={frames}"
+        f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+        f":s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={FPS}"
+    )
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1", "-i", image_path,
+        "-vf", vf,
+        "-t", f"{duration:.3f}",
+        "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "faster", "-crf", "18",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg (scene clip render) failed:\n{result.stderr[-1500:]}")
 
 
 def assemble_video(manifest_path, images_dir, audio_path, output_path, progress_callback=None):
@@ -108,47 +175,60 @@ def assemble_video(manifest_path, images_dir, audio_path, output_path, progress_
 
     filled_scene_ids = [e["scene_id"] for e in scene_entries if e.get("filled_from_adjacent")]
 
+    # Reconcile the image timeline to the actual audio length so the video
+    # is never a hair short or long of the narration — no manual checking
+    # required. Correct the last scene first (least visible change); if
+    # that would make it awkwardly short, spread the correction evenly
+    # instead.
+    audio_duration = _get_audio_duration_seconds(audio_path)
+    if audio_duration is not None:
+        total_image_duration = sum(e["duration"] for e in scene_entries)
+        diff = audio_duration - total_image_duration
+        if abs(diff) > 0.3 and scene_entries:
+            adjusted_last = scene_entries[-1]["duration"] + diff
+            if adjusted_last >= 0.5:
+                scene_entries[-1]["duration"] = adjusted_last
+            else:
+                per_scene_adjust = diff / len(scene_entries)
+                for entry in scene_entries:
+                    entry["duration"] = max(0.5, entry["duration"] + per_scene_adjust)
+            if progress_callback:
+                progress_callback(0, total,
+                                   f"Adjusted scene timing by {diff:+.2f}s total to exactly match narration length.")
+
     work_dir = tempfile.mkdtemp(prefix="video_assembly_")
-    concat_list_path = os.path.join(work_dir, "concat_list.txt")
-    concat_lines = []
-    last_image_line = None
+    clip_paths = []
 
     for i, entry in enumerate(scene_entries):
-        if entry["image_path"] is None:
-            continue  # only possible if truly no image exists in the whole batch
-        image_line = f"file '{entry['image_path']}'"
-        concat_lines.append(image_line)
-        concat_lines.append(f"duration {entry['duration']}")
-        last_image_line = image_line
+        clip_path = os.path.join(work_dir, f"clip_{i:04d}.mp4")
+        zoom_out = (i % 2 == 1)
+        _render_scene_clip(entry["image_path"], entry["duration"], clip_path, zoom_out)
+        clip_paths.append(clip_path)
 
         if progress_callback:
             note = " (filled from adjacent scene — swap in later)" if entry.get("filled_from_adjacent") else ""
-            progress_callback(i + 1, total, f"Scene {entry['scene_id']} queued ({entry['duration']:.1f}s){note}.")
+            progress_callback(i + 1, total, f"Scene {entry['scene_id']} rendered ({entry['duration']:.1f}s){note}.")
 
-    # The ffmpeg concat demuxer requires the final image repeated without a
-    # trailing duration line, or the last image gets cut short.
-    concat_lines.append(last_image_line)
-
+    concat_list_path = os.path.join(work_dir, "concat_list.txt")
     with open(concat_list_path, "w") as f:
-        f.write("\n".join(concat_lines))
+        f.write("\n".join(f"file '{p}'" for p in clip_paths))
 
     silent_video_path = os.path.join(work_dir, "silent.mp4")
-    cmd_video = [
+    cmd_concat = [
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0", "-i", concat_list_path,
-        "-r", "30", "-pix_fmt", "yuv420p",
-        "-c:v", "libx264",
+        "-c", "copy",
         silent_video_path,
     ]
-    result = subprocess.run(cmd_video, capture_output=True, text=True)
+    result = subprocess.run(cmd_concat, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg (image assembly) failed:\n{result.stderr[-2000:]}")
+        raise RuntimeError(f"ffmpeg (clip concat) failed:\n{result.stderr[-2000:]}")
 
     cmd_mux = [
         "ffmpeg", "-y",
         "-i", silent_video_path,
         "-i", audio_path,
-        "-c:v", "copy", "-c:a", "aac",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
         "-shortest",
         output_path,
     ]
