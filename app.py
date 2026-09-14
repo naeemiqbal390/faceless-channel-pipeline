@@ -346,7 +346,8 @@ with tab0:
 
                 st.video(final_path)
                 with open(final_path, "rb") as f:
-                    st.download_button("Download final_video.mp4", f, file_name="final_video.mp4", mime="video/mp4")
+                    st.download_button("Download final_video.mp4", f, file_name="final_video.mp4", mime="video/mp4",
+                                        key="dl_video_pipeline")
 
             except Exception as e:
                 st.error(f"Pipeline stopped: {e}")
@@ -379,7 +380,8 @@ with tab_audio:
     if "audio_path" in st.session_state:
         st.audio(st.session_state["audio_path"])
         with open(st.session_state["audio_path"], "rb") as f:
-            st.download_button("Download narration.mp3", f, file_name="narration.mp3", mime="audio/mpeg")
+            st.download_button("Download narration.mp3", f, file_name="narration.mp3", mime="audio/mpeg",
+                                key="dl_audio_tab")
 
 with tab_align:
     saved_script2 = st.session_state.get("script_text", "")
@@ -408,7 +410,8 @@ with tab_align:
                     st.session_state["manifest_path"] = manifest_path
                     st.success(f"Aligned {n_scenes} scenes.")
                     with open(manifest_path, "rb") as f:
-                        st.download_button("Download scene_manifest.csv", f, file_name="scene_manifest.csv")
+                        st.download_button("Download scene_manifest.csv", f, file_name="scene_manifest.csv",
+                                            key="dl_manifest_tab")
                 except Exception as e:
                     st.error(f"Alignment failed: {e}")
 
@@ -491,7 +494,8 @@ with tab_images:
                         "Download scene_images_batch.zip",
                         f,
                         file_name="scene_images_batch.zip",
-                        mime="application/zip"
+                        mime="application/zip",
+                        key="dl_images_tab"
                         )
             except Exception as e:
                 st.error(f"Image generation failed: {e}")
@@ -563,4 +567,5 @@ with tab_video:
     if st.session_state.get("video_path") and os.path.exists(st.session_state["video_path"]):
         st.video(st.session_state["video_path"])
         with open(st.session_state["video_path"], "rb") as f:
-            st.download_button("Download final_video.mp4", f, file_name="final_video.mp4", mime="video/mp4")
+            st.download_button("Download final_video.mp4", f, file_name="final_video.mp4", mime="video/mp4",
+                                key="dl_video_tab")
