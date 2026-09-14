@@ -1,22 +1,27 @@
 """
 pollinations_runner.py
-Image generation via Pollinations.ai's free, keyless image API.
+Image generation via Pollinations.ai's image API.
 
 - Plain HTTP GET to https://image.pollinations.ai/prompt/{prompt}, returns
-  raw image bytes directly — no SDK, no API key required for anonymous use.
-- No published daily cap (unlike Gemini's free tier, which turned out to
-  have zero allocation for image models on this account) — it's throttled
-  by request rate instead, roughly one request per ~15 seconds anonymously.
-  A free account (no card) raises that rate and drops the watermark.
+  raw image bytes directly — no SDK. Works with no API key at all, but a
+  free Pollinations account token (from auth.pollinations.ai, no card)
+  unlocks: a faster rate limit, a genuinely watermark-free "nologo" result,
+  and access to premium models paid for out of a small weekly free credit
+  ("Pollen") allowance.
+- MODEL HIERARCHY: tries the best available model first (premium models
+  that spend Pollen credits), and automatically falls back down the list
+  the moment a model is unavailable or its credit is exhausted — landing
+  on "flux"/"turbo", which are genuinely free and unlimited, for the bulk
+  of any run once premium credit runs out. This means the first handful of
+  images in a run may be noticeably higher quality than the rest — that's
+  expected, not a bug, given how small the free weekly Pollen allowance is.
 - Same resumable / non-blocking-failure / automatic-retry-round design as
-  the Gemini version: a failed scene is parked and retried later without
-  blocking the scenes after it, and successes always land under their
-  correct scene_id filename so they slot into the right spot in the video.
-- Falls back from "flux" to "turbo" if the primary model has trouble.
+  before: a failed scene is parked and retried later without blocking the
+  scenes after it, and successes always land under their correct scene_id
+  filename so they slot into the right spot in the video.
 """
 
 import os
-import re
 import time
 import json
 import random
@@ -29,27 +34,24 @@ RUNS_DIR = os.path.join(tempfile.gettempdir(), "pipeline_runs")
 
 BASE_URL = "https://image.pollinations.ai/prompt/"
 
-# Best-quality-first. "turbo" is the fallback if "flux" has trouble — still
-# decent quality, just faster/lighter. Add new Pollinations model names here
-# if they add better free models later.
-MODEL_CANDIDATES = ["flux", "turbo"]
+# Best-quality-first. Premium models (💎 in Pollinations' own docs) spend a
+# small weekly free Pollen credit and require a token; "flux"/"turbo" are
+# the always-free, unlimited backbone at the bottom of the list. The run
+# tries top-down and permanently drops to the next candidate the moment a
+# model reports itself unavailable or out of credit — add new premium
+# model names here as Pollinations ships them, no other code changes needed.
+MODEL_CANDIDATES_WITH_TOKEN = ["nanobanana", "seedream", "gptimage", "flux", "turbo"]
+MODEL_CANDIDATES_NO_TOKEN = ["flux", "turbo"]  # premium models require a token — skip straight to the free ones
 
 RETRY_ROUNDS = 3
 
 # Anonymous Pollinations use is documented at roughly one request per 15
-# seconds. A free (no-card) account at auth.pollinations.ai raises this —
-# if you register, lower ceiling_rpm's denominator accordingly, i.e. raise
-# ceiling_rpm below.
-FLOOR_RPM = 2      # slowest: one request per 30s, if things are struggling
-CEILING_RPM = 5    # fastest: one request per 12s, a bit above the documented anon rate
-START_RPM = 4
-
-# Prepended to every scene prompt to keep the established visual style
-# consistent across the whole batch.
-STYLE_PREFIX = (
-    "Simple black and white stick-figure illustration, minimal line art "
-    "style, plain background. Scene: "
-)
+# seconds. A registered (free, no-card) account raises this meaningfully —
+# since a token is now expected to be configured, pacing defaults to the
+# faster registered-tier assumption and only falls back to the slower
+# anonymous pacing if no token is present.
+ANON_PACING = dict(floor_rpm=2, ceiling_rpm=5, start_rpm=4)
+TOKEN_PACING = dict(floor_rpm=4, ceiling_rpm=15, start_rpm=8)
 
 IMAGE_WIDTH = 1024
 IMAGE_HEIGHT = 1024
@@ -57,6 +59,42 @@ IMAGE_HEIGHT = 1024
 # A real image is never this small — anything under this is almost
 # certainly an HTML error page or truncated response, not a photo.
 MIN_VALID_IMAGE_BYTES = 2000
+
+# Models whose "quality" parameter Pollinations documents as actually
+# honored (others are said to ignore it, so there's no harm sending it
+# broadly, but this is what it's known to matter for).
+QUALITY_AWARE_MODELS = {"gptimage", "gptimage-large", "gpt-image-2"}
+
+# Visual style presets — prepended to every scene prompt. "Style" here means
+# a general aesthetic descriptor (palette, line work, era), not a request to
+# reproduce any specific studio's copyrighted characters or film stills.
+STYLE_PRESETS = {
+    "Stick Figure": (
+        "Simple black and white stick-figure illustration, minimal line art "
+        "style, plain background. Scene: "
+    ),
+    "Anime / Hand-Painted (Ghibli-inspired)": (
+        "Hand-painted 2D anime background art, soft watercolor palette, "
+        "whimsical storybook atmosphere, warm natural lighting. Scene: "
+    ),
+    "1980s Retro Anime": (
+        "1980s retro anime style, grainy film texture, bold cel-shaded "
+        "colors, vintage VHS aesthetic. Scene: "
+    ),
+    "Watercolor": (
+        "Soft watercolor painting, gentle visible brush strokes, muted "
+        "pastel color palette. Scene: "
+    ),
+    "Comic Book": (
+        "Bold comic book illustration, heavy ink outlines, halftone "
+        "shading, vibrant saturated colors. Scene: "
+    ),
+    "Photorealistic": (
+        "Photorealistic, cinematic lighting, high detail, shot on 35mm "
+        "film. Scene: "
+    ),
+}
+DEFAULT_STYLE = "Stick Figure"
 
 
 # --------------------------------------------------------------------------
@@ -138,8 +176,7 @@ class AdaptiveRateLimiter:
     moment a rate-limit response is seen.
     """
 
-    def __init__(self, floor_rpm=FLOOR_RPM, ceiling_rpm=CEILING_RPM,
-                 start_rpm=START_RPM, successes_per_speedup=4):
+    def __init__(self, floor_rpm, ceiling_rpm, start_rpm, successes_per_speedup=4):
         self.min_interval = 60.0 / ceiling_rpm
         self.max_interval = 60.0 / floor_rpm
         self.interval = 60.0 / start_rpm
@@ -185,6 +222,12 @@ class ModelState:
 
 def _classify_error(err_text):
     lowered = err_text.lower()
+    # Out of Pollen credit, or this model needs a higher account tier than
+    # this token has — permanent for the rest of this run, so treat it the
+    # same as model-unavailable: drop to the next candidate immediately.
+    if any(tok in lowered for tok in
+           ["402", "insufficient", "credit", "pollen", "tier required", "upgrade"]):
+        return "model_unavailable"
     if "429" in err_text or "too many requests" in lowered or "rate limit" in lowered:
         return "rate_limit"
     if any(tok in lowered for tok in ["502", "503", "504", "bad gateway", "gateway timeout", "unavailable"]):
@@ -207,6 +250,8 @@ def _attempt_generate(model_name, prompt_text, out_path, token=None):
         "private": "true",
         "safe": "true",
     }
+    if model_name in QUALITY_AWARE_MODELS:
+        params["quality"] = "high"
     if token:
         params["token"] = token
 
@@ -232,7 +277,7 @@ def _generate_with_fallback(model_state, prompt_text, out_path, rate_limiter, to
     Single "best effort" attempt at one image: tries the current model
     (with one same-model retry for rate-limit/transient hiccups), and
     switches to the next candidate model when the failure looks like a
-    genuine model-availability problem. Raises on total failure — the
+    genuine availability or credit problem. Raises on total failure — the
     caller decides what happens next (park it for a later retry round).
     """
     last_err = None
@@ -277,19 +322,22 @@ def _generate_with_fallback(model_state, prompt_text, out_path, rate_limiter, to
 # Main entry point
 # --------------------------------------------------------------------------
 
-def run_image_generation(manifest_path, api_key, progress_callback=None):
+def run_image_generation(manifest_path, api_key, progress_callback=None, style=DEFAULT_STYLE):
     """
     Generates one image per manifest row via Pollinations.ai.
 
-    'api_key' here is an OPTIONAL Pollinations account token (unlike Gemini,
-    Pollinations works fully anonymously — pass "" or None to use it that
-    way). A token just raises the rate limit and drops the watermark.
+    'api_key' is an OPTIONAL Pollinations account token — pass "" or None to
+    use anonymously (free models only, slower pacing). With a token, premium
+    models are tried first and pacing assumes the faster registered tier.
+
+    'style' selects a STYLE_PRESETS key to prepend to every scene prompt.
 
     progress_callback(done_images, total_images, message)
 
     Returns (images_dir, zip_path, failed_scene_ids).
     """
     token = api_key or None
+    style_prefix = STYLE_PRESETS.get(style, STYLE_PRESETS[DEFAULT_STYLE])
 
     df = _load_manifest_df(manifest_path)
     images_dir = get_images_dir(manifest_path)
@@ -314,17 +362,19 @@ def run_image_generation(manifest_path, api_key, progress_callback=None):
         progress_callback(done_images, total_images,
                            f"Resuming — {done_images}/{total_images} images already done.")
 
-    model_state = ModelState(list(MODEL_CANDIDATES))
-    rate_limiter = AdaptiveRateLimiter()
+    candidates = MODEL_CANDIDATES_WITH_TOKEN if token else MODEL_CANDIDATES_NO_TOKEN
+    pacing = TOKEN_PACING if token else ANON_PACING
+    model_state = ModelState(list(candidates))
+    rate_limiter = AdaptiveRateLimiter(**pacing)
     last_model_reported = model_state.current()
 
     if progress_callback and pending:
-        note = " (anonymous — pass a token for a faster rate)" if not token else ""
+        note = "" if token else " (anonymous — add a Pollinations token for premium models + faster pacing)"
         progress_callback(done_images, total_images, f"Starting with model: {model_state.current()}{note}")
 
     def _run_one(scene_id, prompt, out_path):
         nonlocal done_images, last_model_reported
-        full_prompt = STYLE_PREFIX + prompt
+        full_prompt = style_prefix + prompt
         rate_limiter.wait()
         try:
             _generate_with_fallback(model_state, full_prompt, out_path, rate_limiter, token)
