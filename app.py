@@ -243,6 +243,12 @@ with tab0:
 
     st.divider()
     voice_auto = st.selectbox("Voice", EDGE_TTS_VOICES, key="voice_auto")
+
+    import pollinations_runner
+    style_options = list(pollinations_runner.STYLE_PRESETS.keys())
+    style_auto = st.selectbox("Image style", style_options, key="style_auto")
+    st.session_state["image_style"] = style_auto
+
     pollinations_token_auto = st.text_input(
         "Pollinations token (optional — leave blank to use anonymously, or set POLLINATIONS_TOKEN in Secrets)",
         type="password", key="pk_auto",
@@ -266,11 +272,17 @@ with tab0:
                                                   work_dir=get_session_temp_dir())
                 st.session_state["audio_path"] = audio_path
                 audio_bar.progress(1.0)
+                with open(audio_path, "rb") as f:
+                    st.download_button("Download narration.mp3", f, file_name="narration.mp3",
+                                        mime="audio/mpeg", key="dl_audio_pipeline")
 
                 with st.spinner("Step 2/4 — aligning..."):
                     manifest_path, n_scenes = align_script_to_audio_file(pasted_script, audio_path,
                                                                           work_dir=get_session_temp_dir())
                     st.session_state["manifest_path"] = manifest_path
+                with open(manifest_path, "rb") as f:
+                    st.download_button("Download scene_manifest.csv", f, file_name="scene_manifest.csv",
+                                        mime="text/csv", key="dl_manifest_pipeline")
 
                 st.markdown("**Step 3/4 — images**")
                 image_bar = st.progress(0.0)
@@ -292,7 +304,8 @@ with tab0:
                 force_fix_manifest_csv(active_manifest)
 
                 images_dir, zip_path, failed_scenes = pollinations_runner.run_image_generation(
-                    active_manifest, pollinations_token, progress_callback=on_image_progress
+                    active_manifest, pollinations_token, progress_callback=on_image_progress,
+                    style=st.session_state.get("image_style", pollinations_runner.DEFAULT_STYLE),
                 )
                 st.session_state["images_dir"] = images_dir
                 image_bar.progress(1.0)
@@ -301,6 +314,9 @@ with tab0:
                                f"Re-run image generation to retry just those.")
                 else:
                     st.success("All images generated.")
+                with open(zip_path, "rb") as f:
+                    st.download_button("Download scene_images_batch.zip", f, file_name="scene_images_batch.zip",
+                                        mime="application/zip", key="dl_images_pipeline")
 
                 st.markdown("**Step 4/4 — video**")
                 video_bar = st.progress(0.0)
@@ -336,10 +352,15 @@ with tab0:
                 st.error(f"Pipeline stopped: {e}")
 
 with tab_audio:
-    default_script = st.session_state.get("script_text", "")
-    script_for_audio = st.text_area("Script", default_script, height=300, key="audio_script")
+    saved_script = st.session_state.get("script_text", "")
+    if not saved_script:
+        st.warning("No script saved yet — paste and save your script in tab 1 first.")
+    else:
+        with st.expander("Script being used (edit it in tab 1, not here)"):
+            st.text_area("Script", saved_script, height=200, key="audio_script_preview", disabled=True)
+
     voice = st.selectbox("Voice", EDGE_TTS_VOICES)
-    if st.button("Generate audio", type="primary"):
+    if st.button("Generate audio", type="primary", disabled=not saved_script):
         progress_bar = st.progress(0.0)
         status_text = st.empty()
 
@@ -348,7 +369,7 @@ with tab_audio:
             status_text.markdown(f"**{done}/{total} audio segments** generated")
 
         try:
-            path = generate_audio_file(script_for_audio, voice, progress_callback=on_audio_progress,
+            path = generate_audio_file(saved_script, voice, progress_callback=on_audio_progress,
                                         work_dir=get_session_temp_dir())
             st.session_state["audio_path"] = path
             progress_bar.progress(1.0)
@@ -357,12 +378,19 @@ with tab_audio:
             st.error(f"Audio generation failed: {e}")
     if "audio_path" in st.session_state:
         st.audio(st.session_state["audio_path"])
+        with open(st.session_state["audio_path"], "rb") as f:
+            st.download_button("Download narration.mp3", f, file_name="narration.mp3", mime="audio/mpeg")
 
 with tab_align:
-    default_script2 = st.session_state.get("script_text", "")
-    script_for_align = st.text_area("Script", default_script2, height=300, key="align_script")
+    saved_script2 = st.session_state.get("script_text", "")
+    if not saved_script2:
+        st.warning("No script saved yet — paste and save your script in tab 1 first.")
+    else:
+        with st.expander("Script being used (edit it in tab 1, not here)"):
+            st.text_area("Script", saved_script2, height=200, key="align_script_preview", disabled=True)
+
     uploaded_audio = st.file_uploader("Finished audio (optional)", type=["mp3", "wav"])
-    if st.button("Generate scene manifest", type="primary"):
+    if st.button("Generate scene manifest", type="primary", disabled=not saved_script2):
         if not uploaded_audio and "audio_path" not in st.session_state:
             st.warning("Generate or upload audio first.")
         else:
@@ -375,7 +403,7 @@ with tab_align:
                         st.session_state["audio_path"] = audio_path
                     else:
                         audio_path = st.session_state["audio_path"]
-                    manifest_path, n_scenes = align_script_to_audio_file(script_for_align, audio_path,
+                    manifest_path, n_scenes = align_script_to_audio_file(saved_script2, audio_path,
                                                                           work_dir=get_session_temp_dir())
                     st.session_state["manifest_path"] = manifest_path
                     st.success(f"Aligned {n_scenes} scenes.")
@@ -418,6 +446,13 @@ with tab_images:
         type="password", key="tab_images_key",
     )
 
+    import pollinations_runner
+    style_options = list(pollinations_runner.STYLE_PRESETS.keys())
+    default_style = st.session_state.get("image_style", pollinations_runner.DEFAULT_STYLE)
+    default_index = style_options.index(default_style) if default_style in style_options else 0
+    style_override = st.selectbox("Image style", style_options, index=default_index, key="tab_images_style")
+    st.session_state["image_style"] = style_override
+
     if st.button("Generate Images", type="primary"):
         if not active_manifest_path or not os.path.exists(active_manifest_path):
             st.error("Missing manifest file! Please upload a CSV or run alignment.")
@@ -439,7 +474,8 @@ with tab_images:
                 force_fix_manifest_csv(active_manifest_path)
 
                 images_dir, zip_path, failed_scenes = pollinations_runner.run_image_generation(
-                    active_manifest_path, pollinations_token, progress_callback=on_image_progress
+                    active_manifest_path, pollinations_token, progress_callback=on_image_progress,
+                    style=style_override,
                 )
                 st.session_state["images_dir"] = images_dir
 
