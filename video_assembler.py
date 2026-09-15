@@ -131,6 +131,7 @@ def assemble_video(manifest_path, images_dir, audio_path, output_path, progress_
     """
     df = _load_manifest_df(manifest_path)
     total = len(df)
+    audio_duration = _get_audio_duration_seconds(audio_path)
 
     scene_entries = []
     for i, row in df.iterrows():
@@ -143,14 +144,12 @@ def assemble_video(manifest_path, images_dir, audio_path, output_path, progress_
         if not os.path.exists(image_path):
             image_path = None
 
-        start_s = _hhmmss_to_seconds(row.get("start_time"))
-        end_s = _hhmmss_to_seconds(row.get("end_time"))
-        if start_s is not None and end_s is not None and end_s > start_s:
-            duration = end_s - start_s
-        else:
-            duration = 3.0  # fallback when timing is missing
-
-        scene_entries.append({"scene_id": scene_id, "image_path": image_path, "duration": duration})
+        scene_entries.append({
+            "scene_id": scene_id,
+            "image_path": image_path,
+            "start_s": _hhmmss_to_seconds(row.get("start_time")),
+            "end_s": _hhmmss_to_seconds(row.get("end_time")),
+        })
 
     # Forward-fill gaps from the previous available scene, then back-fill
     # any leading gaps (before the first available image) from the next one.
@@ -175,26 +174,48 @@ def assemble_video(manifest_path, images_dir, audio_path, output_path, progress_
 
     filled_scene_ids = [e["scene_id"] for e in scene_entries if e.get("filled_from_adjacent")]
 
-    # Reconcile the image timeline to the actual audio length so the video
-    # is never a hair short or long of the narration — no manual checking
-    # required. Correct the last scene first (least visible change); if
-    # that would make it awkwardly short, spread the correction evenly
-    # instead.
-    audio_duration = _get_audio_duration_seconds(audio_path)
-    if audio_duration is not None:
-        total_image_duration = sum(e["duration"] for e in scene_entries)
-        diff = audio_duration - total_image_duration
-        if abs(diff) > 0.3 and scene_entries:
-            adjusted_last = scene_entries[-1]["duration"] + diff
-            if adjusted_last >= 0.5:
-                scene_entries[-1]["duration"] = adjusted_last
+    # TIMING: each scene's image covers from ITS OWN start_time up to the
+    # NEXT scene's start_time — NOT each scene's own (end_time - start_time)
+    # span. Real manifests routinely have several-second gaps between one
+    # scene's detected end and the next scene's detected start (a pause, a
+    # beat, alignment slack). Chaining only each scene's narrow span
+    # together silently drops every one of those gaps — the video ends up
+    # shorter than the narration and drifts further out of sync with every
+    # scene after the first gap. Using start-to-next-start guarantees the
+    # visual timeline covers the ENTIRE audio with zero gaps.
+    starts = [e["start_s"] for e in scene_entries]
+    for i, s in enumerate(starts):
+        if s is None:
+            if i == 0:
+                starts[i] = 0.0
             else:
-                per_scene_adjust = diff / len(scene_entries)
-                for entry in scene_entries:
-                    entry["duration"] = max(0.5, entry["duration"] + per_scene_adjust)
-            if progress_callback:
-                progress_callback(0, total,
-                                   f"Adjusted scene timing by {diff:+.2f}s total to exactly match narration length.")
+                fallback = scene_entries[i].get("end_s")
+                prev = starts[i - 1]
+                starts[i] = fallback if (fallback is not None and fallback > prev) else prev + 0.5
+
+    # Guard against any out-of-order or noisy timestamps in the manifest.
+    for i in range(1, len(starts)):
+        if starts[i] < starts[i - 1]:
+            starts[i] = starts[i - 1]
+
+    final_end = audio_duration
+    if final_end is None or final_end < starts[-1]:
+        final_end = starts[-1] + (scene_entries[-1].get("end_s") or starts[-1] + 3.0) - starts[-1]
+
+    boundaries = starts + [final_end]
+    # The first scene covers from t=0, not from its own detected start —
+    # there's usually a few seconds of intro narration before the first
+    # scene's exact words begin, and skipping that would leave the video's
+    # opening seconds blank.
+    boundaries[0] = 0.0
+
+    for i, entry in enumerate(scene_entries):
+        entry["duration"] = max(0.5, boundaries[i + 1] - boundaries[i])
+
+    if progress_callback:
+        total_span = boundaries[-1] - boundaries[0]
+        audio_note = f", audio is {audio_duration:.1f}s" if audio_duration is not None else " (audio duration unknown — using manifest timing as-is)"
+        progress_callback(0, total, f"Scene timeline covers {total_span:.1f}s gaplessly{audio_note}.")
 
     work_dir = tempfile.mkdtemp(prefix="video_assembly_")
     clip_paths = []
