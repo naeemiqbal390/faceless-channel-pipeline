@@ -1,20 +1,21 @@
 """
 pollinations_runner.py
-Image generation via Pollinations.ai's image API.
+Image generation via Pollinations.ai.
 
-- Plain HTTP GET to https://image.pollinations.ai/prompt/{prompt}, returns
-  raw image bytes directly — no SDK. Works with no API key at all, but a
-  free Pollinations account token (from auth.pollinations.ai, no card)
-  unlocks: a faster rate limit, a genuinely watermark-free "nologo" result,
-  and access to premium models paid for out of a small weekly free credit
-  ("Pollen") allowance.
-- MODEL HIERARCHY: tries the best available model first (premium models
-  that spend Pollen credits), and automatically falls back down the list
-  the moment a model is unavailable or its credit is exhausted — landing
-  on "flux"/"turbo", which are genuinely free and unlimited, for the bulk
-  of any run once premium credit runs out. This means the first handful of
-  images in a run may be noticeably higher quality than the rest — that's
-  expected, not a bug, given how small the free weekly Pollen allowance is.
+TWO SEPARATE AUTH SYSTEMS, AUTO-DETECTED BY KEY FORMAT:
+- No key, or a plain legacy token: uses the older, genuinely free, no-signup
+  endpoint at image.pollinations.ai. Anonymous is throttled (~1 req/15s) and
+  always watermarked; the legacy "token" registration system only ever
+  affected this endpoint.
+- A key starting with "sk_" or "pk_": this is a credential for Pollinations'
+  newer metered gateway at gen.pollinations.ai. It unlocks all premium
+  models, no watermark, and much higher throughput — but EVERY image,
+  including flux, spends Pollen credit from that key's balance. It's cheap,
+  but no longer literally free the way anonymous access is. Check your
+  balance at enter.pollinations.ai.
+- MODEL HIERARCHY: tries the best available model first, and automatically
+  falls back down the list the moment a model is unavailable or (on the
+  metered gateway) out of credit.
 - Same resumable / non-blocking-failure / automatic-retry-round design as
   before: a failed scene is parked and retried later without blocking the
   scenes after it, and successes always land under their correct scene_id
@@ -32,26 +33,30 @@ from urllib.parse import quote
 
 RUNS_DIR = os.path.join(tempfile.gettempdir(), "pipeline_runs")
 
-BASE_URL = "https://image.pollinations.ai/prompt/"
+LEGACY_BASE_URL = "https://image.pollinations.ai/prompt/"
+GATEWAY_BASE_URL = "https://gen.pollinations.ai/image/"
 
-# Best-quality-first. Premium models (💎 in Pollinations' own docs) spend a
-# small weekly free Pollen credit and require a token; "flux"/"turbo" are
-# the always-free, unlimited backbone at the bottom of the list. The run
-# tries top-down and permanently drops to the next candidate the moment a
-# model reports itself unavailable or out of credit — add new premium
-# model names here as Pollinations ships them, no other code changes needed.
-MODEL_CANDIDATES_WITH_TOKEN = ["nanobanana", "seedream", "gptimage", "flux", "turbo"]
-MODEL_CANDIDATES_NO_TOKEN = ["flux", "turbo"]  # premium models require a token — skip straight to the free ones
+
+def _is_gateway_key(token):
+    return bool(token) and token.startswith(("sk_", "pk_"))
+
+
+# Best-quality-first. Premium models are only reachable via the metered
+# gen.pollinations.ai gateway (an sk_/pk_ key); "flux"/"turbo" work on
+# both, free and unlimited on the legacy anonymous endpoint. The run tries
+# top-down and permanently drops to the next candidate the moment a model
+# reports itself unavailable or out of credit — add new premium model
+# names here as Pollinations ships them, no other code changes needed.
+MODEL_CANDIDATES_GATEWAY = ["nanobanana", "seedream", "gptimage", "flux", "turbo"]
+MODEL_CANDIDATES_LEGACY = ["flux", "turbo"]  # the only models the free anonymous endpoint serves
 
 RETRY_ROUNDS = 3
 
-# Anonymous Pollinations use is documented at roughly one request per 15
-# seconds. A registered (free, no-card) account raises this meaningfully —
-# since a token is now expected to be configured, pacing defaults to the
-# faster registered-tier assumption and only falls back to the slower
-# anonymous pacing if no token is present.
-ANON_PACING = dict(floor_rpm=2, ceiling_rpm=5, start_rpm=4)
-TOKEN_PACING = dict(floor_rpm=4, ceiling_rpm=15, start_rpm=8)
+# Anonymous legacy use is documented at roughly one request per 15 seconds.
+# The metered gateway (an actual account with credit) tolerates much higher
+# throughput.
+LEGACY_PACING = dict(floor_rpm=2, ceiling_rpm=5, start_rpm=4)
+GATEWAY_PACING = dict(floor_rpm=4, ceiling_rpm=15, start_rpm=8)
 
 IMAGE_WIDTH = 1024
 IMAGE_HEIGHT = 1024
@@ -65,34 +70,78 @@ MIN_VALID_IMAGE_BYTES = 2000
 # broadly, but this is what it's known to matter for).
 QUALITY_AWARE_MODELS = {"gptimage", "gptimage-large", "gpt-image-2"}
 
-# Visual style presets — prepended to every scene prompt. "Style" here means
-# a general aesthetic descriptor (palette, line work, era), not a request to
-# reproduce any specific studio's copyrighted characters or film stills.
+# Applied to every style, on top of that style's own specific negative
+# prompt. Diffusion models are notoriously bad at rendering legible text —
+# if your scene prompts ever ask for on-screen captions/labels, this won't
+# make that work, it'll just stop a failed text attempt from wrecking the
+# rest of the composition. The real fix for on-screen text is to burn it in
+# with ffmpeg after generation, not ask the image model to paint the words.
+UNIVERSAL_NEGATIVE = (
+    "text, words, letters, typography, captions, subtitles, watermark, "
+    "logo, signature, username, garbled text, illegible text, extra limbs, "
+    "malformed hands, disfigured, deformed, mutated, bad anatomy, ugly, "
+    "poorly drawn, low resolution, jpeg artifacts, cropped, out of frame, "
+    "duplicate, worst quality, low quality"
+)
+
+# Visual style presets — prepended to every scene prompt, paired with a
+# negative_prompt that actively steers the model AWAY from the qualities
+# that tend to sabotage that particular style (e.g. diffusion models often
+# drift toward soft painterly renders even when asked for plain line art,
+# unless something actively pushes back against that). "Style" here means
+# a general aesthetic descriptor (palette, line work, era), not a request
+# to reproduce any specific studio's copyrighted characters or film stills.
 STYLE_PRESETS = {
-    "Stick Figure": (
-        "Simple black and white stick-figure illustration, minimal line art "
-        "style, plain background. Scene: "
-    ),
-    "Anime / Hand-Painted (Ghibli-inspired)": (
-        "Hand-painted 2D anime background art, soft watercolor palette, "
-        "whimsical storybook atmosphere, warm natural lighting. Scene: "
-    ),
-    "1980s Retro Anime": (
-        "1980s retro anime style, grainy film texture, bold cel-shaded "
-        "colors, vintage VHS aesthetic. Scene: "
-    ),
-    "Watercolor": (
-        "Soft watercolor painting, gentle visible brush strokes, muted "
-        "pastel color palette. Scene: "
-    ),
-    "Comic Book": (
-        "Bold comic book illustration, heavy ink outlines, halftone "
-        "shading, vibrant saturated colors. Scene: "
-    ),
-    "Photorealistic": (
-        "Photorealistic, cinematic lighting, high detail, shot on 35mm "
-        "film. Scene: "
-    ),
+    "Stick Figure": {
+        "prompt": (
+            "Extremely simple 2D vector clip-art icon. Pure white flat "
+            "background. A minimalist stick-figure character made of thin, "
+            "uniform, solid black ink outlines only: a plain circle for the "
+            "head, straight simple lines for the body and limbs. Flat "
+            "graphic design, like a pictogram or clipart icon. Scene: "
+        ),
+        "negative": (
+            "photorealistic, 3d render, realistic skin, realistic anatomy, "
+            "shading, gradient, painting, watercolor, airbrush, soft focus, "
+            "blurry, textured, abstract, amorphous blob, noise, complex "
+            "detail, photography, cinematic lighting, film grain"
+        ),
+    },
+    "Anime / Hand-Painted (Ghibli-inspired)": {
+        "prompt": (
+            "Hand-painted 2D anime background art, soft watercolor palette, "
+            "whimsical storybook atmosphere, warm natural lighting. Scene: "
+        ),
+        "negative": "photorealistic, 3d render, photography, blurry, low detail, abstract",
+    },
+    "1980s Retro Anime": {
+        "prompt": (
+            "1980s retro anime style, grainy film texture, bold cel-shaded "
+            "colors, vintage VHS aesthetic. Scene: "
+        ),
+        "negative": "modern digital art, 3d render, photorealistic, blurry, low detail",
+    },
+    "Watercolor": {
+        "prompt": (
+            "Soft watercolor painting, gentle visible brush strokes, muted "
+            "pastel color palette. Scene: "
+        ),
+        "negative": "photorealistic, 3d render, digital vector art, hard edges, blurry",
+    },
+    "Comic Book": {
+        "prompt": (
+            "Bold comic book illustration, heavy ink outlines, halftone "
+            "shading, vibrant saturated colors. Scene: "
+        ),
+        "negative": "photorealistic, 3d render, watercolor, soft focus, blurry, muted colors",
+    },
+    "Photorealistic": {
+        "prompt": (
+            "Photorealistic, cinematic lighting, high detail, shot on 35mm "
+            "film. Scene: "
+        ),
+        "negative": "cartoon, illustration, line art, painting, low detail, blurry, abstract",
+    },
 }
 DEFAULT_STYLE = "Stick Figure"
 
@@ -237,10 +286,9 @@ def _classify_error(err_text):
     return "other"
 
 
-def _attempt_generate(model_name, prompt_text, out_path, token=None):
+def _attempt_generate(model_name, prompt_text, out_path, token=None, negative_prompt=None):
     import requests
 
-    url = BASE_URL + quote(prompt_text)
     params = {
         "model": model_name,
         "width": IMAGE_WIDTH,
@@ -252,10 +300,19 @@ def _attempt_generate(model_name, prompt_text, out_path, token=None):
     }
     if model_name in QUALITY_AWARE_MODELS:
         params["quality"] = "high"
-    if token:
-        params["token"] = token
+    if negative_prompt:
+        params["negative_prompt"] = negative_prompt
 
-    response = requests.get(url, params=params, timeout=90)
+    headers = {}
+    if _is_gateway_key(token):
+        url = GATEWAY_BASE_URL + quote(prompt_text)
+        headers["Authorization"] = f"Bearer {token}"
+    else:
+        url = LEGACY_BASE_URL + quote(prompt_text)
+        if token:
+            params["token"] = token  # legacy-style token, not an sk_/pk_ key
+
+    response = requests.get(url, params=params, headers=headers, timeout=90)
 
     if response.status_code != 200:
         raise RuntimeError(f"{response.status_code}: {response.text[:300]}")
@@ -272,7 +329,7 @@ def _attempt_generate(model_name, prompt_text, out_path, token=None):
     return True
 
 
-def _generate_with_fallback(model_state, prompt_text, out_path, rate_limiter, token):
+def _generate_with_fallback(model_state, prompt_text, out_path, rate_limiter, token, negative_prompt=None):
     """
     Single "best effort" attempt at one image: tries the current model
     (with one same-model retry for rate-limit/transient hiccups), and
@@ -287,7 +344,7 @@ def _generate_with_fallback(model_state, prompt_text, out_path, rate_limiter, to
 
         for local_attempt in range(2):
             try:
-                _attempt_generate(model_name, prompt_text, out_path, token)
+                _attempt_generate(model_name, prompt_text, out_path, token, negative_prompt)
                 rate_limiter.record_success()
                 return
             except Exception as e:
@@ -337,7 +394,9 @@ def run_image_generation(manifest_path, api_key, progress_callback=None, style=D
     Returns (images_dir, zip_path, failed_scene_ids).
     """
     token = api_key or None
-    style_prefix = STYLE_PRESETS.get(style, STYLE_PRESETS[DEFAULT_STYLE])
+    style_config = STYLE_PRESETS.get(style, STYLE_PRESETS[DEFAULT_STYLE])
+    style_prefix = style_config["prompt"]
+    negative_prompt = style_config.get("negative", "") + ", " + UNIVERSAL_NEGATIVE
 
     df = _load_manifest_df(manifest_path)
     images_dir = get_images_dir(manifest_path)
@@ -362,22 +421,31 @@ def run_image_generation(manifest_path, api_key, progress_callback=None, style=D
         progress_callback(done_images, total_images,
                            f"Resuming — {done_images}/{total_images} images already done.")
 
-    candidates = MODEL_CANDIDATES_WITH_TOKEN if token else MODEL_CANDIDATES_NO_TOKEN
-    pacing = TOKEN_PACING if token else ANON_PACING
+    use_gateway = _is_gateway_key(token)
+    candidates = MODEL_CANDIDATES_GATEWAY if use_gateway else MODEL_CANDIDATES_LEGACY
+    pacing = GATEWAY_PACING if use_gateway else LEGACY_PACING
     model_state = ModelState(list(candidates))
     rate_limiter = AdaptiveRateLimiter(**pacing)
     last_model_reported = model_state.current()
 
     if progress_callback and pending:
-        note = "" if token else " (anonymous — add a Pollinations token for premium models + faster pacing)"
-        progress_callback(done_images, total_images, f"Starting with model: {model_state.current()}{note}")
+        # Unambiguous either way — tells you which auth path was actually
+        # used, since a malformed key silently falls back to legacy anon.
+        if use_gateway:
+            mode_note = "using metered gateway (gen.pollinations.ai) — spends Pollen credit per image"
+        elif token:
+            mode_note = "using legacy token (image.pollinations.ai) — free, but key format wasn't sk_/pk_"
+        else:
+            mode_note = "no key — anonymous legacy endpoint, free but watermarked and rate-limited"
+        progress_callback(done_images, total_images,
+                           f"Starting with model: {model_state.current()} ({mode_note}, style: {style}).")
 
     def _run_one(scene_id, prompt, out_path):
         nonlocal done_images, last_model_reported
         full_prompt = style_prefix + prompt
         rate_limiter.wait()
         try:
-            _generate_with_fallback(model_state, full_prompt, out_path, rate_limiter, token)
+            _generate_with_fallback(model_state, full_prompt, out_path, rate_limiter, token, negative_prompt)
             done_images += 1
             if progress_callback:
                 progress_callback(done_images, total_images,
