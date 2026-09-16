@@ -76,12 +76,41 @@ QUALITY_AWARE_MODELS = {"gptimage", "gptimage-large", "gpt-image-2"}
 # make that work, it'll just stop a failed text attempt from wrecking the
 # rest of the composition. The real fix for on-screen text is to burn it in
 # with ffmpeg after generation, not ask the image model to paint the words.
+# Applied to every style, on top of that style's own specific negative
+# prompt. Grouped by the actual failure categories seen in real output
+# (including a fused/malformed-anatomy creature confirmed from a real
+# generated video) — a short generic negative prompt is not enough to
+# reliably suppress anatomical distortion; it needs to name the specific
+# failure modes. Diffusion models are also notoriously bad at rendering
+# legible text — if scene prompts ever ask for on-screen captions/labels,
+# no negative prompt fixes that; the real fix is burning text in with
+# ffmpeg after generation, not asking the image model to paint words.
 UNIVERSAL_NEGATIVE = (
-    "text, words, letters, typography, captions, subtitles, watermark, "
-    "logo, signature, username, garbled text, illegible text, extra limbs, "
-    "malformed hands, disfigured, deformed, mutated, bad anatomy, ugly, "
-    "poorly drawn, low resolution, jpeg artifacts, cropped, out of frame, "
-    "duplicate, worst quality, low quality"
+    # Anatomy / malformation — the category that produced the fused,
+    # multi-limbed creature seen in testing
+    "two heads, multiple heads, extra heads, duplicate head, second head, "
+    "conjoined, siamese twins, extra limbs, missing limbs, extra legs, "
+    "extra arms, too many legs, too many arms, fused limbs, merged limbs, "
+    "melted limbs, floating limbs, disconnected limbs, malformed hands, "
+    "extra fingers, missing fingers, fused fingers, mutated hands, "
+    "disfigured face, asymmetric face, distorted face, warped face, "
+    "melted face, deformed body, mutated anatomy, bad anatomy, "
+    "anatomically incorrect, disproportionate body, elongated body, "
+    "warped proportions, extra body parts, malformed anatomy, "
+    "cloned face, duplicate body parts, "
+    # Text — models can't render legible text reliably
+    "text, words, letters, numbers, typography, captions, subtitles, "
+    "watermark, logo, signature, username, stamp, garbled text, "
+    "illegible text, "
+    # Rendering / technical quality
+    "blurry, out of focus, low resolution, pixelated, jpeg artifacts, "
+    "compression artifacts, noise, grain, low contrast, washed out, "
+    "muddy colors, overexposed, underexposed, flat lighting, no depth, "
+    "smudged, smeared, muddled details, undefined edges, "
+    # Composition defects
+    "cropped, out of frame, cut off, duplicate, cloned, tiling, collage, "
+    "multiple panels, split screen, extra background elements, "
+    "worst quality, low quality, poorly drawn, ugly"
 )
 
 # Visual style presets — prepended to every scene prompt, paired with a
@@ -144,6 +173,17 @@ STYLE_PRESETS = {
     },
 }
 DEFAULT_STYLE = "Stick Figure"
+
+# Appended after every style's own prompt, right before the scene content.
+# Pairing an explicit positive instruction with the negative prompt is
+# meaningfully more effective than negation alone for anatomy specifically —
+# models respond better to being told what correct looks like, not just
+# what to avoid.
+ANATOMY_POSITIVE = (
+    "Correct, coherent anatomy: exactly one head, exactly one face, "
+    "the correct number of limbs, symmetrical features, natural "
+    "proportions. "
+)
 
 
 # --------------------------------------------------------------------------
@@ -395,7 +435,7 @@ def run_image_generation(manifest_path, api_key, progress_callback=None, style=D
     """
     token = api_key or None
     style_config = STYLE_PRESETS.get(style, STYLE_PRESETS[DEFAULT_STYLE])
-    style_prefix = style_config["prompt"]
+    style_prefix = style_config["prompt"] + ANATOMY_POSITIVE
     negative_prompt = style_config.get("negative", "") + ", " + UNIVERSAL_NEGATIVE
 
     df = _load_manifest_df(manifest_path)
@@ -429,14 +469,19 @@ def run_image_generation(manifest_path, api_key, progress_callback=None, style=D
     last_model_reported = model_state.current()
 
     if progress_callback and pending:
-        # Unambiguous either way — tells you which auth path was actually
-        # used, since a malformed key silently falls back to legacy anon.
-        if use_gateway:
-            mode_note = "using metered gateway (gen.pollinations.ai) — spends Pollen credit per image"
-        elif token:
-            mode_note = "using legacy token (image.pollinations.ai) — free, but key format wasn't sk_/pk_"
+        # Unambiguous either way — a masked preview of the actual key
+        # received (never the full value) proves definitively whether the
+        # app is even seeing a token, rather than inferring it indirectly.
+        if token:
+            masked = token[:6] + "…" + token[-4:] if len(token) > 12 else token[:3] + "…"
         else:
-            mode_note = "no key — anonymous legacy endpoint, free but watermarked and rate-limited"
+            masked = "(none)"
+        if use_gateway:
+            mode_note = f"using metered gateway (gen.pollinations.ai), key={masked} — spends Pollen credit per image"
+        elif token:
+            mode_note = f"using legacy token (image.pollinations.ai), key={masked} — free, but not sk_/pk_ format"
+        else:
+            mode_note = "no key received — anonymous legacy endpoint, free but watermarked and rate-limited"
         progress_callback(done_images, total_images,
                            f"Starting with model: {model_state.current()} ({mode_note}, style: {style}).")
 
