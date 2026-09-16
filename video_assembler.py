@@ -84,6 +84,19 @@ def _get_audio_duration_seconds(audio_path):
         return None
 
 
+# Constant zoom speed (fraction per second) rather than a fixed total zoom
+# amount — a 2-second scene and a 20-second scene zooming to the same total
+# 15% would make the short one look like a snap-jump, not a slow drift.
+ZOOM_RATE_PER_SECOND = 0.015
+
+# Upscale factor applied before zoompan. Zooming directly on a 1024x1024
+# source gives the crop window too little sub-pixel precision, so it snaps
+# between slightly different integer pixel positions each frame — visible
+# as a jittery "shake" rather than a smooth drift. Pre-scaling to a much
+# larger canvas first gives zoompan the precision to move smoothly.
+ZOOMPAN_UPSCALE = 4096
+
+
 def _render_scene_clip(image_path, duration, output_path, zoom_out):
     """
     Renders one scene's image into a short video clip with a slow,
@@ -93,14 +106,16 @@ def _render_scene_clip(image_path, duration, output_path, zoom_out):
     """
     duration = max(0.5, duration)
     frames = max(1, round(duration * FPS))
-    step = (MAX_ZOOM - 1.0) / frames
+    effective_max_zoom = min(MAX_ZOOM, 1.0 + ZOOM_RATE_PER_SECOND * duration)
+    step = (effective_max_zoom - 1.0) / frames
 
     if zoom_out:
-        zoom_expr = f"if(eq(on,1),{MAX_ZOOM},max(zoom-{step:.6f},1.0))"
+        zoom_expr = f"if(eq(on,1),{effective_max_zoom},max(zoom-{step:.6f},1.0))"
     else:
-        zoom_expr = f"min(zoom+{step:.6f},{MAX_ZOOM})"
+        zoom_expr = f"min(zoom+{step:.6f},{effective_max_zoom})"
 
     vf = (
+        f"scale={ZOOMPAN_UPSCALE}:{ZOOMPAN_UPSCALE}:flags=lanczos,"
         f"zoompan=z='{zoom_expr}':d={frames}"
         f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
         f":s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={FPS}"
