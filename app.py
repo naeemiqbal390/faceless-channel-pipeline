@@ -215,6 +215,34 @@ def make_progress_log(container, max_lines_shown=40):
     return _log
 
 
+def make_image_gallery(container, images_dir, cols=5, max_shown=15):
+    """
+    Renders the most recently generated images as a thumbnail grid,
+    refreshed on demand — lets you actually see quality along the way
+    instead of waiting for the whole batch to finish. Reads the images
+    directory fresh each call rather than tracking state, since
+    pollinations_runner writes deterministic scene_NNN.png filenames.
+    """
+    def _refresh():
+        try:
+            files = sorted(f for f in os.listdir(images_dir) if f.lower().endswith(".png"))
+        except Exception:
+            files = []
+        recent = files[-max_shown:]
+        with container.container():
+            if not recent:
+                st.caption("Images will appear here as they're generated.")
+                return
+            rows = [recent[i:i + cols] for i in range(0, len(recent), cols)]
+            for row in rows:
+                row_cols = st.columns(cols)
+                for cell, fname in zip(row_cols, row):
+                    cell.image(os.path.join(images_dir, fname), use_container_width=True,
+                               caption=fname.replace(".png", ""))
+
+    return _refresh
+
+
 # Interface setup
 st.set_page_config(page_title="Faceless Channel Pipeline", layout="wide")
 st.title("Faceless Channel Pipeline")
@@ -285,21 +313,31 @@ with tab0:
                                         mime="text/csv", key="dl_manifest_pipeline")
 
                 st.markdown("**Step 3/4 — images**")
-                image_bar = st.progress(0.0)
-                image_status = st.empty()
-                image_log = make_progress_log(image_status)
-
-                def on_image_progress(done_images, total_images, message):
-                    pct = done_images / total_images if total_images else 0
-                    image_bar.progress(min(pct, 1.0))
-                    image_log(f"{done_images}/{total_images} images generated — {message}")
-
                 import pollinations_runner
                 pollinations_token = get_secret("POLLINATIONS_TOKEN", pollinations_token_auto)
 
                 active_manifest = st.session_state.get("manifest_path")
                 if not active_manifest or not os.path.exists(active_manifest):
                     raise ValueError("Manifest path unresolved or non-existent.")
+
+                images_dir_preview = pollinations_runner.get_images_dir(active_manifest)
+
+                log_col, gallery_col = st.columns([2, 3])
+                with log_col:
+                    image_bar = st.progress(0.0)
+                    image_status = st.empty()
+                image_log = make_progress_log(image_status)
+                with gallery_col:
+                    st.caption("Generated so far (most recent):")
+                    gallery_placeholder = st.empty()
+                refresh_gallery = make_image_gallery(gallery_placeholder, images_dir_preview)
+                refresh_gallery()
+
+                def on_image_progress(done_images, total_images, message):
+                    pct = done_images / total_images if total_images else 0
+                    image_bar.progress(min(pct, 1.0))
+                    image_log(f"{done_images}/{total_images} images generated — {message}")
+                    refresh_gallery()
 
                 force_fix_manifest_csv(active_manifest)
 
@@ -463,16 +501,25 @@ with tab_images:
             try:
                 pollinations_token = get_secret("POLLINATIONS_TOKEN", pollinations_token_override)
 
-                image_bar = st.progress(0.0)
-                image_status = st.empty()
+                import pollinations_runner
+                images_dir_preview = pollinations_runner.get_images_dir(active_manifest_path)
+
+                log_col, gallery_col = st.columns([2, 3])
+                with log_col:
+                    image_bar = st.progress(0.0)
+                    image_status = st.empty()
                 image_log = make_progress_log(image_status)
+                with gallery_col:
+                    st.caption("Generated so far (most recent):")
+                    gallery_placeholder = st.empty()
+                refresh_gallery = make_image_gallery(gallery_placeholder, images_dir_preview)
+                refresh_gallery()
 
                 def on_image_progress(done_images, total_images, message):
                     pct = done_images / total_images if total_images else 0
                     image_bar.progress(min(pct, 1.0))
                     image_log(f"{done_images}/{total_images} images generated — {message}")
-
-                import pollinations_runner
+                    refresh_gallery()
 
                 force_fix_manifest_csv(active_manifest_path)
 
