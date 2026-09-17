@@ -8,6 +8,7 @@ import re
 import csv
 import json
 import uuid
+import hashlib
 import tempfile
 import asyncio
 from difflib import SequenceMatcher
@@ -29,6 +30,99 @@ def get_session_temp_dir():
         os.makedirs(session_dir, exist_ok=True)
         st.session_state["session_temp_dir"] = session_dir
     return st.session_state["session_temp_dir"]
+
+
+def compute_project_id(script_text):
+    """
+    A stable ID derived from the script's own content — the same script
+    pasted back in later (even after a full container restart, with zero
+    other state carried over) resolves to the same project automatically,
+    with no separate bookkeeping needed.
+    """
+    return hashlib.sha256(script_text.encode("utf-8")).hexdigest()[:16]
+
+
+def get_project_status(project_id):
+    """
+    Returns what's saved in B2 for this project, or None if B2 isn't
+    configured or nothing's saved yet. This is what /tmp being wiped on
+    every container restart/sleep/redeploy can't take away — it lives
+    outside the app's ephemeral filesystem entirely.
+    """
+    import b2_storage
+    if not b2_storage.is_configured():
+        return None
+    prefix = f"projects/{project_id}/"
+    keys = b2_storage.list_keys(prefix)
+    if not keys:
+        return None
+    image_keys = [k for k in keys if "/scene_images/" in k and k.endswith(".png")]
+    return {
+        "has_audio": any(k.endswith("narration.mp3") for k in keys),
+        "has_manifest": any(k.endswith("scene_manifest.csv") for k in keys),
+        "num_images": len(image_keys),
+        "has_video": any(k.endswith("final_video.mp4") for k in keys),
+    }
+
+
+def resume_project_from_b2(project_id):
+    """Downloads every saved artifact for this project into the current
+    session's local workspace and restores session_state to match, so the
+    rest of the app picks up exactly where it left off — including image
+    generation, since pollinations_runner's own skip-if-exists resume logic
+    then sees these files as already done."""
+    import b2_storage
+    session_dir = get_session_temp_dir()
+    prefix = f"projects/{project_id}/"
+
+    audio_key = prefix + "narration.mp3"
+    if b2_storage.key_exists(audio_key):
+        local_audio = os.path.join(session_dir, "narration.mp3")
+        if b2_storage.download_file(audio_key, local_audio):
+            st.session_state["audio_path"] = local_audio
+
+    manifest_key = prefix + "scene_manifest.csv"
+    local_manifest = None
+    if b2_storage.key_exists(manifest_key):
+        local_manifest = os.path.join(session_dir, "scene_manifest.csv")
+        if b2_storage.download_file(manifest_key, local_manifest):
+            st.session_state["manifest_path"] = local_manifest
+
+    if local_manifest:
+        import pollinations_runner
+        images_dir = pollinations_runner.get_images_dir(local_manifest)
+        image_keys = [k for k in b2_storage.list_keys(prefix + "scene_images/") if k.endswith(".png")]
+        for k in image_keys:
+            b2_storage.download_file(k, os.path.join(images_dir, os.path.basename(k)))
+        if image_keys:
+            st.session_state["images_dir"] = images_dir
+
+    video_key = prefix + "final_video.mp4"
+    if b2_storage.key_exists(video_key):
+        local_video = os.path.join(session_dir, "final_video.mp4")
+        if b2_storage.download_file(video_key, local_video):
+            st.session_state["video_path"] = local_video
+
+    st.session_state["project_id"] = project_id
+
+
+def upload_to_project(local_path, relative_name):
+    """
+    Best-effort upload of a finished artifact to B2 under the current
+    script's project ID. Never raises — persistence failing should never
+    break the pipeline itself, just mean that piece isn't backed up.
+    """
+    script_text = st.session_state.get("script_text", "")
+    if not script_text or not local_path or not os.path.exists(local_path):
+        return
+    try:
+        import b2_storage
+        if not b2_storage.is_configured():
+            return
+        project_id = compute_project_id(script_text)
+        b2_storage.upload_file(local_path, f"projects/{project_id}/{relative_name}")
+    except Exception:
+        pass
 
 
 def force_fix_manifest_csv(csv_path):
@@ -71,13 +165,26 @@ EDGE_TTS_VOICES = [
 ]
 
 
-def get_secret(key_name, user_input=""):
+def get_secret(key_names, user_input=""):
+    """
+    key_names can be a single string or a list of acceptable names — tries
+    each in order. This exists because a secret named slightly differently
+    than what the code expects (e.g. POLLINATIONS_API_KEY vs
+    POLLINATIONS_TOKEN) fails a plain st.secrets[name] lookup silently,
+    with no error — it just quietly returns empty, which is exactly what
+    happened here.
+    """
     if user_input and user_input.strip():
         return user_input.strip()
-    try:
-        return st.secrets[key_name]
-    except Exception:
-        return ""
+    names = key_names if isinstance(key_names, (list, tuple)) else [key_names]
+    for name in names:
+        try:
+            value = st.secrets[name]
+            if value:
+                return value
+        except Exception:
+            continue
+    return ""
 
 
 def parse_script_scenes(raw):
@@ -269,6 +376,39 @@ with tab0:
             word_count = len(re.findall(r"\S+", narration_only))
             st.success(f"Saved — {scene_count} scenes, ~{word_count} words.")
 
+    # Check for previously saved progress on this exact script — survives
+    # container restarts, sleeps, and walking away for hours, since it's
+    # read from B2 rather than this session's (ephemeral) state.
+    saved_script_check = st.session_state.get("script_text", "")
+    if saved_script_check:
+        import b2_storage
+        if b2_storage.is_configured():
+            check_project_id = compute_project_id(saved_script_check)
+            project_status = get_project_status(check_project_id)
+            if project_status:
+                status_bits = [
+                    "audio ✓" if project_status["has_audio"] else "audio ✗",
+                    "manifest ✓" if project_status["has_manifest"] else "manifest ✗",
+                    f"{project_status['num_images']} images saved",
+                    "video ✓" if project_status["has_video"] else "video ✗",
+                ]
+                st.info(f"Saved progress found for this script: {', '.join(status_bits)}")
+                resume_col, clear_col = st.columns(2)
+                if resume_col.button("Resume — load saved progress", type="primary"):
+                    resume_project_from_b2(check_project_id)
+                    st.success("Progress restored. Continue from whichever tab you left off on.")
+                    st.rerun()
+                if clear_col.button("Clear saved progress — back to stage 1"):
+                    b2_storage.delete_prefix(f"projects/{check_project_id}/")
+                    for key in ["script_text", "audio_path", "manifest_path", "images_dir",
+                                "video_path", "project_id"]:
+                        st.session_state.pop(key, None)
+                    st.success("Cleared. Starting over.")
+                    st.rerun()
+        else:
+            st.caption("Add B2_KEY_ID / B2_APPLICATION_KEY / B2_BUCKET_NAME / B2_ENDPOINT_URL to Secrets to "
+                       "enable save/resume across sessions and restarts.")
+
     st.divider()
     voice_auto = st.selectbox("Voice", EDGE_TTS_VOICES, key="voice_auto")
 
@@ -299,6 +439,7 @@ with tab0:
                 audio_path = generate_audio_file(pasted_script, voice_auto, progress_callback=on_audio_progress,
                                                   work_dir=get_session_temp_dir())
                 st.session_state["audio_path"] = audio_path
+                upload_to_project(audio_path, "narration.mp3")
                 audio_bar.progress(1.0)
                 with open(audio_path, "rb") as f:
                     st.download_button("Download narration.mp3", f, file_name="narration.mp3",
@@ -308,18 +449,26 @@ with tab0:
                     manifest_path, n_scenes = align_script_to_audio_file(pasted_script, audio_path,
                                                                           work_dir=get_session_temp_dir())
                     st.session_state["manifest_path"] = manifest_path
+                    upload_to_project(manifest_path, "scene_manifest.csv")
                 with open(manifest_path, "rb") as f:
                     st.download_button("Download scene_manifest.csv", f, file_name="scene_manifest.csv",
                                         mime="text/csv", key="dl_manifest_pipeline")
 
                 st.markdown("**Step 3/4 — images**")
                 import pollinations_runner
-                pollinations_token = get_secret("POLLINATIONS_TOKEN", pollinations_token_auto)
+                pollinations_token = get_secret(["POLLINATIONS_TOKEN", "POLLINATIONS_API_KEY"], pollinations_token_auto)
 
                 active_manifest = st.session_state.get("manifest_path")
                 if not active_manifest or not os.path.exists(active_manifest):
                     raise ValueError("Manifest path unresolved or non-existent.")
 
+                # Must normalize BEFORE computing the images directory — it's
+                # hashed from the file's bytes, and normalizing changes those
+                # bytes (line endings/encoding) even for an already-valid
+                # file. Doing this after previewing the gallery directory
+                # made the preview point at a different folder than the one
+                # generation actually wrote to.
+                force_fix_manifest_csv(active_manifest)
                 images_dir_preview = pollinations_runner.get_images_dir(active_manifest)
 
                 log_col, gallery_col = st.columns([2, 3])
@@ -339,11 +488,13 @@ with tab0:
                     image_log(f"{done_images}/{total_images} images generated — {message}")
                     refresh_gallery()
 
-                force_fix_manifest_csv(active_manifest)
+                def on_image_saved(scene_id, local_path):
+                    upload_to_project(local_path, f"scene_images/{os.path.basename(local_path)}")
 
                 images_dir, zip_path, failed_scenes = pollinations_runner.run_image_generation(
                     active_manifest, pollinations_token, progress_callback=on_image_progress,
                     style=st.session_state.get("image_style", pollinations_runner.DEFAULT_STYLE),
+                    on_image_saved=on_image_saved,
                 )
                 st.session_state["images_dir"] = images_dir
                 image_bar.progress(1.0)
@@ -373,6 +524,7 @@ with tab0:
                     progress_callback=on_video_progress,
                 )
                 st.session_state["video_path"] = final_path
+                upload_to_project(final_path, "final_video.mp4")
                 video_bar.progress(1.0)
                 if filled_scenes:
                     st.warning(f"Video assembled and fully in sync — but {len(filled_scenes)} scene(s) didn't "
@@ -411,6 +563,7 @@ with tab_audio:
             path = generate_audio_file(saved_script, voice, progress_callback=on_audio_progress,
                                         work_dir=get_session_temp_dir())
             st.session_state["audio_path"] = path
+            upload_to_project(path, "narration.mp3")
             progress_bar.progress(1.0)
             st.success("Audio generated.")
         except Exception as e:
@@ -446,6 +599,7 @@ with tab_align:
                     manifest_path, n_scenes = align_script_to_audio_file(saved_script2, audio_path,
                                                                           work_dir=get_session_temp_dir())
                     st.session_state["manifest_path"] = manifest_path
+                    upload_to_project(manifest_path, "scene_manifest.csv")
                     st.success(f"Aligned {n_scenes} scenes.")
                     with open(manifest_path, "rb") as f:
                         st.download_button("Download scene_manifest.csv", f, file_name="scene_manifest.csv",
@@ -499,9 +653,10 @@ with tab_images:
             st.error("Missing manifest file! Please upload a CSV or run alignment.")
         else:
             try:
-                pollinations_token = get_secret("POLLINATIONS_TOKEN", pollinations_token_override)
+                pollinations_token = get_secret(["POLLINATIONS_TOKEN", "POLLINATIONS_API_KEY"], pollinations_token_override)
 
                 import pollinations_runner
+                force_fix_manifest_csv(active_manifest_path)
                 images_dir_preview = pollinations_runner.get_images_dir(active_manifest_path)
 
                 log_col, gallery_col = st.columns([2, 3])
@@ -521,11 +676,13 @@ with tab_images:
                     image_log(f"{done_images}/{total_images} images generated — {message}")
                     refresh_gallery()
 
-                force_fix_manifest_csv(active_manifest_path)
+                def on_image_saved(scene_id, local_path):
+                    upload_to_project(local_path, f"scene_images/{os.path.basename(local_path)}")
 
                 images_dir, zip_path, failed_scenes = pollinations_runner.run_image_generation(
                     active_manifest_path, pollinations_token, progress_callback=on_image_progress,
                     style=style_override,
+                    on_image_saved=on_image_saved,
                 )
                 st.session_state["images_dir"] = images_dir
 
@@ -598,6 +755,7 @@ with tab_video:
                     output_video_path, progress_callback=on_video_progress,
                 )
                 st.session_state["video_path"] = final_path
+                upload_to_project(final_path, "final_video.mp4")
                 video_bar.progress(1.0)
 
                 if filled_scenes:
