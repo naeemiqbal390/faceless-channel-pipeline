@@ -47,8 +47,8 @@ def _is_gateway_key(token):
 # top-down and permanently drops to the next candidate the moment a model
 # reports itself unavailable or out of credit — add new premium model
 # names here as Pollinations ships them, no other code changes needed.
-MODEL_CANDIDATES_GATEWAY = ["nanobanana", "seedream", "gptimage", "flux", "turbo"]
-MODEL_CANDIDATES_LEGACY = ["flux", "turbo"]  # the only models the free anonymous endpoint serves
+MODEL_CANDIDATES_GATEWAY = ["nanobanana", "seedream", "gptimage", "flux"]
+MODEL_CANDIDATES_LEGACY = ["flux"]  # turbo deliberately excluded — lower quality tier; retry rounds keep trying flux instead of silently downgrading
 
 RETRY_ROUNDS = 3
 
@@ -419,7 +419,7 @@ def _generate_with_fallback(model_state, prompt_text, out_path, rate_limiter, to
 # Main entry point
 # --------------------------------------------------------------------------
 
-def run_image_generation(manifest_path, api_key, progress_callback=None, style=DEFAULT_STYLE):
+def run_image_generation(manifest_path, api_key, progress_callback=None, style=DEFAULT_STYLE, on_image_saved=None):
     """
     Generates one image per manifest row via Pollinations.ai.
 
@@ -428,6 +428,11 @@ def run_image_generation(manifest_path, api_key, progress_callback=None, style=D
     models are tried first and pacing assumes the faster registered tier.
 
     'style' selects a STYLE_PRESETS key to prepend to every scene prompt.
+
+    'on_image_saved(scene_id, local_path)' — optional hook called right
+    after each image is successfully written, before moving to the next
+    scene. Used to persist images to remote storage incrementally rather
+    than waiting for the whole batch to finish.
 
     progress_callback(done_images, total_images, message)
 
@@ -492,6 +497,11 @@ def run_image_generation(manifest_path, api_key, progress_callback=None, style=D
         try:
             _generate_with_fallback(model_state, full_prompt, out_path, rate_limiter, token, negative_prompt)
             done_images += 1
+            if on_image_saved:
+                try:
+                    on_image_saved(scene_id, out_path)
+                except Exception:
+                    pass  # persistence hook failing must never abort generation itself
             if progress_callback:
                 progress_callback(done_images, total_images,
                                    f"Scene {scene_id} done (~{rate_limiter.current_rpm} req/min).")
