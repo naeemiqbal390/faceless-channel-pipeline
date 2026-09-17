@@ -412,6 +412,20 @@ def _generate_with_fallback(model_state, prompt_text, out_path, rate_limiter, to
         else:
             break
 
+    # Last resort: if every gateway model failed — commonly because the
+    # account's Pollen credit is completely exhausted, which returns 402
+    # even for plain flux — fall back to the genuinely free, keyless
+    # anonymous endpoint rather than permanently losing this scene for the
+    # rest of the run. Watermarked and slower, but keeps real generated
+    # images flowing instead of leaning on neighbor-fill in the video step.
+    if _is_gateway_key(token):
+        try:
+            _attempt_generate("flux", prompt_text, out_path, token=None, negative_prompt=negative_prompt)
+            rate_limiter.record_success()
+            return
+        except Exception as e:
+            last_err = f"{last_err} | anonymous fallback also failed: {e}"
+
     raise RuntimeError(last_err or "Unknown image generation error")
 
 
