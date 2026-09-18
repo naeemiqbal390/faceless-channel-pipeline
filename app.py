@@ -395,9 +395,9 @@ with tab0:
                 st.info(f"Saved progress found for this script: {', '.join(status_bits)}")
                 resume_col, clear_col = st.columns(2)
                 if resume_col.button("Resume — load saved progress", type="primary"):
-                    resume_project_from_b2(check_project_id)
-                    st.success("Progress restored. Continue from whichever tab you left off on.")
-                    st.rerun()
+                    with st.spinner("Downloading saved progress from B2..."):
+                        resume_project_from_b2(check_project_id)
+                    st.success("Progress restored — shown below.")
                 if clear_col.button("Clear saved progress — back to stage 1"):
                     b2_storage.delete_prefix(f"projects/{check_project_id}/")
                     for key in ["script_text", "audio_path", "manifest_path", "images_dir",
@@ -408,6 +408,30 @@ with tab0:
         else:
             st.caption("Add B2_KEY_ID / B2_APPLICATION_KEY / B2_BUCKET_NAME / B2_ENDPOINT_URL to Secrets to "
                        "enable save/resume across sessions and restarts.")
+
+    # Shown right here, in the same tab, whenever anything is loaded —
+    # right after Resume, or after any pipeline step completes — so there's
+    # no need to go hunting through other tabs to confirm something worked.
+    has_any_status = any(st.session_state.get(k) for k in
+                          ["audio_path", "manifest_path", "images_dir", "video_path"])
+    if has_any_status:
+        st.markdown("**Current project status:**")
+        audio_p = st.session_state.get("audio_path")
+        if audio_p and os.path.exists(audio_p):
+            st.audio(audio_p)
+        manifest_p = st.session_state.get("manifest_path")
+        if manifest_p and os.path.exists(manifest_p):
+            st.caption(f"Manifest ready: {os.path.basename(manifest_p)}")
+        images_d = st.session_state.get("images_dir")
+        if images_d and os.path.isdir(images_d):
+            n_imgs = len([f for f in os.listdir(images_d) if f.lower().endswith(".png")])
+            st.caption(f"{n_imgs} image(s) available.")
+        video_p = st.session_state.get("video_path")
+        if video_p and os.path.exists(video_p):
+            st.video(video_p)
+            with open(video_p, "rb") as f:
+                st.download_button("Download final_video.mp4", f, file_name="final_video.mp4",
+                                    mime="video/mp4", key="dl_video_tab0_status")
 
     st.divider()
     voice_auto = st.selectbox("Voice", EDGE_TTS_VOICES, key="voice_auto")
@@ -448,6 +472,11 @@ with tab0:
                 with st.spinner("Step 2/4 — aligning..."):
                     manifest_path, n_scenes = align_script_to_audio_file(pasted_script, audio_path,
                                                                           work_dir=get_session_temp_dir())
+                    # Normalize BEFORE saving anywhere — get_images_dir hashes the
+                    # file's bytes, and normalizing later would change those
+                    # bytes, making the B2-saved copy hash differently than the
+                    # copy actually used for image generation.
+                    force_fix_manifest_csv(manifest_path)
                     st.session_state["manifest_path"] = manifest_path
                     upload_to_project(manifest_path, "scene_manifest.csv")
                 with open(manifest_path, "rb") as f:
@@ -598,6 +627,7 @@ with tab_align:
                         audio_path = st.session_state["audio_path"]
                     manifest_path, n_scenes = align_script_to_audio_file(saved_script2, audio_path,
                                                                           work_dir=get_session_temp_dir())
+                    force_fix_manifest_csv(manifest_path)
                     st.session_state["manifest_path"] = manifest_path
                     upload_to_project(manifest_path, "scene_manifest.csv")
                     st.success(f"Aligned {n_scenes} scenes.")
