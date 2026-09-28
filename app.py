@@ -69,7 +69,7 @@ def resume_project_from_b2(project_id):
     """Downloads every saved artifact for this project into the current
     session's local workspace and restores session_state to match, so the
     rest of the app picks up exactly where it left off — including image
-    generation, since pollinations_runner's own skip-if-exists resume logic
+    generation, since cloudflare_runner's own skip-if-exists resume logic
     then sees these files as already done."""
     import b2_storage
     session_dir = get_session_temp_dir()
@@ -89,8 +89,8 @@ def resume_project_from_b2(project_id):
             st.session_state["manifest_path"] = local_manifest
 
     if local_manifest:
-        import pollinations_runner
-        images_dir = pollinations_runner.get_images_dir(local_manifest)
+        import cloudflare_runner
+        images_dir = cloudflare_runner.get_images_dir(local_manifest)
         image_keys = [k for k in b2_storage.list_keys(prefix + "scene_images/") if k.endswith(".png")]
         for k in image_keys:
             b2_storage.download_file(k, os.path.join(images_dir, os.path.basename(k)))
@@ -328,7 +328,7 @@ def make_image_gallery(container, images_dir, cols=5, max_shown=15):
     refreshed on demand — lets you actually see quality along the way
     instead of waiting for the whole batch to finish. Reads the images
     directory fresh each call rather than tracking state, since
-    pollinations_runner writes deterministic scene_NNN.png filenames.
+    cloudflare_runner writes deterministic scene_NNN.png filenames.
     """
     def _refresh():
         try:
@@ -424,8 +424,10 @@ with tab0:
             st.caption(f"Manifest ready: {os.path.basename(manifest_p)}")
         images_d = st.session_state.get("images_dir")
         if images_d and os.path.isdir(images_d):
-            n_imgs = len([f for f in os.listdir(images_d) if f.lower().endswith(".png")])
-            st.caption(f"{n_imgs} image(s) available.")
+            all_pngs = sorted(f for f in os.listdir(images_d) if f.lower().endswith(".png"))
+            with st.expander(f"{len(all_pngs)} image(s) available — click to review", expanded=False):
+                status_gallery_placeholder = st.empty()
+                make_image_gallery(status_gallery_placeholder, images_d, max_shown=40)()
         video_p = st.session_state.get("video_path")
         if video_p and os.path.exists(video_p):
             st.video(video_p)
@@ -436,14 +438,18 @@ with tab0:
     st.divider()
     voice_auto = st.selectbox("Voice", EDGE_TTS_VOICES, key="voice_auto")
 
-    import pollinations_runner
-    style_options = list(pollinations_runner.STYLE_PRESETS.keys())
+    import cloudflare_runner
+    style_options = list(cloudflare_runner.STYLE_PRESETS.keys())
     style_auto = st.selectbox("Image style", style_options, key="style_auto")
     st.session_state["image_style"] = style_auto
 
-    pollinations_token_auto = st.text_input(
-        "Pollinations token (optional — leave blank to use anonymously, or set POLLINATIONS_TOKEN in Secrets)",
-        type="password", key="pk_auto",
+    cloudflare_account_auto = st.text_input(
+        "Cloudflare Account ID (optional — or set CLOUDFLARE_ACCOUNT_ID in Secrets)",
+        key="cfa_auto",
+    )
+    cloudflare_token_auto = st.text_input(
+        "Cloudflare API token (optional — or set CLOUDFLARE_API_TOKEN in Secrets)",
+        type="password", key="cft_auto",
     )
 
     if col_b.button("Run full pipeline", type="primary"):
@@ -484,8 +490,14 @@ with tab0:
                                         mime="text/csv", key="dl_manifest_pipeline")
 
                 st.markdown("**Step 3/4 — images**")
-                import pollinations_runner
-                pollinations_token = get_secret(["POLLINATIONS_TOKEN", "POLLINATIONS_API_KEY"], pollinations_token_auto)
+                import cloudflare_runner
+                cloudflare_token = get_secret(["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_KEY"], cloudflare_token_auto)
+                cloudflare_account = get_secret(["CLOUDFLARE_ACCOUNT_ID"], cloudflare_account_auto)
+                if not cloudflare_token or not cloudflare_account:
+                    raise ValueError(
+                        "Cloudflare credentials missing — add CLOUDFLARE_ACCOUNT_ID and "
+                        "CLOUDFLARE_API_TOKEN to Secrets (or enter them in the fields above)."
+                    )
 
                 active_manifest = st.session_state.get("manifest_path")
                 if not active_manifest or not os.path.exists(active_manifest):
@@ -498,7 +510,7 @@ with tab0:
                 # made the preview point at a different folder than the one
                 # generation actually wrote to.
                 force_fix_manifest_csv(active_manifest)
-                images_dir_preview = pollinations_runner.get_images_dir(active_manifest)
+                images_dir_preview = cloudflare_runner.get_images_dir(active_manifest)
 
                 log_col, gallery_col = st.columns([2, 3])
                 with log_col:
@@ -520,10 +532,11 @@ with tab0:
                 def on_image_saved(scene_id, local_path):
                     upload_to_project(local_path, f"scene_images/{os.path.basename(local_path)}")
 
-                images_dir, zip_path, failed_scenes = pollinations_runner.run_image_generation(
-                    active_manifest, pollinations_token, progress_callback=on_image_progress,
-                    style=st.session_state.get("image_style", pollinations_runner.DEFAULT_STYLE),
+                images_dir, zip_path, failed_scenes = cloudflare_runner.run_image_generation(
+                    active_manifest, cloudflare_token, progress_callback=on_image_progress,
+                    style=st.session_state.get("image_style", cloudflare_runner.DEFAULT_STYLE),
                     on_image_saved=on_image_saved,
+                    account_id=cloudflare_account,
                 )
                 st.session_state["images_dir"] = images_dir
                 image_bar.progress(1.0)
@@ -638,11 +651,12 @@ with tab_align:
                     st.error(f"Alignment failed: {e}")
 
 with tab_images:
-    st.markdown("### Generate Images (Pollinations.ai)")
-    st.caption("Free, keyless image generation (Flux, falling back to Turbo). Paces itself dynamically instead of "
-               "a fixed rate — a failed scene is parked and auto-retried later without blocking the rest. "
-               "Works anonymously; a free Pollinations account token (no card) raises the rate limit and drops "
-               "the watermark, but isn't required.")
+    st.markdown("### Generate Images (Cloudflare Workers AI)")
+    st.caption("Full-step SDXL diffusion (Leonardo Phoenix tried first where your account has it, "
+               "flux-schnell as a fast last resort). Free tier is 10,000 Neurons/day, no card, "
+               "resetting at 00:00 UTC — roughly 40-50 full-quality images/day. Once a day's "
+               "quota runs out, remaining scenes stay parked; come back after the reset and "
+               "click Generate again (or Resume) to continue exactly where it stopped.")
 
     uploaded_manifest = st.file_uploader("scene_manifest.csv (optional)", type=["csv"], key="tab_images_uploader")
 
@@ -656,9 +670,9 @@ with tab_images:
 
     if active_manifest_path and os.path.exists(active_manifest_path):
         st.info(f"Loaded manifest ready: {os.path.basename(active_manifest_path)}")
-        import pollinations_runner
+        import cloudflare_runner
         try:
-            resume_info = pollinations_runner.get_resume_status(active_manifest_path)
+            resume_info = cloudflare_runner.get_resume_status(active_manifest_path)
             if resume_info.get("has_progress"):
                 st.success(f"Found saved progress: {resume_info['done_images']}/{resume_info['total_images']} images already done.")
         except Exception:
@@ -666,14 +680,18 @@ with tab_images:
     else:
         st.warning("No active manifest found. Upload or generate a CSV manifest.")
 
-    pollinations_token_override = st.text_input(
-        "Pollinations token (optional — or set POLLINATIONS_TOKEN in Secrets; blank works fine anonymously)",
+    cloudflare_account_override = st.text_input(
+        "Cloudflare Account ID (optional — or set CLOUDFLARE_ACCOUNT_ID in Secrets)",
+        key="tab_images_account",
+    )
+    cloudflare_token_override = st.text_input(
+        "Cloudflare API token (optional — or set CLOUDFLARE_API_TOKEN in Secrets)",
         type="password", key="tab_images_key",
     )
 
-    import pollinations_runner
-    style_options = list(pollinations_runner.STYLE_PRESETS.keys())
-    default_style = st.session_state.get("image_style", pollinations_runner.DEFAULT_STYLE)
+    import cloudflare_runner
+    style_options = list(cloudflare_runner.STYLE_PRESETS.keys())
+    default_style = st.session_state.get("image_style", cloudflare_runner.DEFAULT_STYLE)
     default_index = style_options.index(default_style) if default_style in style_options else 0
     style_override = st.selectbox("Image style", style_options, index=default_index, key="tab_images_style")
     st.session_state["image_style"] = style_override
@@ -683,11 +701,17 @@ with tab_images:
             st.error("Missing manifest file! Please upload a CSV or run alignment.")
         else:
             try:
-                pollinations_token = get_secret(["POLLINATIONS_TOKEN", "POLLINATIONS_API_KEY"], pollinations_token_override)
+                cloudflare_token = get_secret(["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_KEY"], cloudflare_token_override)
+                cloudflare_account = get_secret(["CLOUDFLARE_ACCOUNT_ID"], cloudflare_account_override)
+                if not cloudflare_token or not cloudflare_account:
+                    raise ValueError(
+                        "Cloudflare credentials missing — add CLOUDFLARE_ACCOUNT_ID and "
+                        "CLOUDFLARE_API_TOKEN to Secrets (or enter them in the fields above)."
+                    )
 
-                import pollinations_runner
+                import cloudflare_runner
                 force_fix_manifest_csv(active_manifest_path)
-                images_dir_preview = pollinations_runner.get_images_dir(active_manifest_path)
+                images_dir_preview = cloudflare_runner.get_images_dir(active_manifest_path)
 
                 log_col, gallery_col = st.columns([2, 3])
                 with log_col:
@@ -709,10 +733,11 @@ with tab_images:
                 def on_image_saved(scene_id, local_path):
                     upload_to_project(local_path, f"scene_images/{os.path.basename(local_path)}")
 
-                images_dir, zip_path, failed_scenes = pollinations_runner.run_image_generation(
-                    active_manifest_path, pollinations_token, progress_callback=on_image_progress,
+                images_dir, zip_path, failed_scenes = cloudflare_runner.run_image_generation(
+                    active_manifest_path, cloudflare_token, progress_callback=on_image_progress,
                     style=style_override,
                     on_image_saved=on_image_saved,
+                    account_id=cloudflare_account,
                 )
                 st.session_state["images_dir"] = images_dir
 
@@ -751,9 +776,9 @@ with tab_video:
             st.session_state["audio_path"] = active_audio_for_video
 
     if active_manifest_for_video and os.path.exists(active_manifest_for_video):
-        import pollinations_runner
-        images_dir_for_video = pollinations_runner.get_images_dir(active_manifest_for_video)
-        resume_info = pollinations_runner.get_resume_status(active_manifest_for_video)
+        import cloudflare_runner
+        images_dir_for_video = cloudflare_runner.get_images_dir(active_manifest_for_video)
+        resume_info = cloudflare_runner.get_resume_status(active_manifest_for_video)
         st.info(f"Images ready: {resume_info['done_images']}/{resume_info['total_images']}")
     else:
         images_dir_for_video = None
