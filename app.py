@@ -344,7 +344,7 @@ def make_image_gallery(container, images_dir, cols=5, max_shown=15):
             for row in rows:
                 row_cols = st.columns(cols)
                 for cell, fname in zip(row_cols, row):
-                    cell.image(os.path.join(images_dir, fname), use_container_width=True,
+                    cell.image(os.path.join(images_dir, fname), width="stretch",
                                caption=fname.replace(".png", ""))
 
     return _refresh
@@ -358,8 +358,8 @@ st.caption("Stick-figure style · unlimited characters · zero cost")
 if "manifest_path" not in st.session_state:
     st.session_state["manifest_path"] = None
 
-tab0, tab_audio, tab_align, tab_images, tab_video = st.tabs(
-    ["1. Paste script", "2. Audio", "3. Align", "4. Images", "5. Video"]
+tab0, tab_audio, tab_align, tab_images, tab_video, tab_youtube = st.tabs(
+    ["1. Paste script", "2. Audio", "3. Align", "4. Images", "5. Video", "6. YouTube"]
 )
 
 with tab0:
@@ -829,3 +829,82 @@ with tab_video:
         with open(st.session_state["video_path"], "rb") as f:
             st.download_button("Download final_video.mp4", f, file_name="final_video.mp4", mime="video/mp4",
                                 key="dl_video_tab")
+
+with tab_youtube:
+    st.markdown("### Publish to YouTube")
+
+    import youtube_uploader
+    if not youtube_uploader.is_configured():
+        st.warning("YouTube isn't connected yet. Add YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, and "
+                   "YOUTUBE_REFRESH_TOKEN to Secrets — see get_youtube_refresh_token.py for the one-time "
+                   "setup (run locally, never on Streamlit Cloud).")
+
+    active_video_path = st.session_state.get("video_path")
+    if not active_video_path or not os.path.exists(active_video_path):
+        st.info("No video ready yet — assemble one in tab 5 first.")
+    else:
+        st.video(active_video_path)
+
+        yt_title = st.text_input("Title", key="yt_title", max_chars=100)
+        yt_description = st.text_area("Description", key="yt_description", height=150)
+        yt_tags = st.text_input("Tags (comma-separated)", key="yt_tags")
+
+        YT_CATEGORIES = {
+            "Education": "27", "Entertainment": "24", "Science & Technology": "28",
+            "Howto & Style": "26", "People & Blogs": "22", "Film & Animation": "1",
+            "Comedy": "23", "News & Politics": "25", "Travel & Events": "19",
+        }
+        yt_category_label = st.selectbox("Category", list(YT_CATEGORIES.keys()), key="yt_category")
+
+        yt_made_for_kids = st.radio("Made for kids?", ["No", "Yes"], key="yt_kids", horizontal=True) == "Yes"
+
+        st.markdown("**Schedule**")
+        US_TIMEZONES = {
+            "Eastern (ET)": "America/New_York",
+            "Central (CT)": "America/Chicago",
+            "Mountain (MT)": "America/Denver",
+            "Pacific (PT)": "America/Los_Angeles",
+        }
+        sched_col1, sched_col2, sched_col3 = st.columns(3)
+        with sched_col1:
+            import datetime
+            default_date = datetime.date.today() + datetime.timedelta(days=1)
+            yt_date = st.date_input("Publish date", value=default_date, key="yt_date")
+        with sched_col2:
+            yt_time = st.time_input("Publish time", value=datetime.time(20, 0), key="yt_time")
+        with sched_col3:
+            yt_tz_label = st.selectbox("Time zone", list(US_TIMEZONES.keys()), key="yt_tz")
+
+        if st.button("Upload & Schedule", type="primary", disabled=not youtube_uploader.is_configured()):
+            if not yt_title.strip():
+                st.error("Title is required.")
+            else:
+                try:
+                    from zoneinfo import ZoneInfo
+                    local_dt = datetime.datetime.combine(yt_date, yt_time)
+                    local_dt = local_dt.replace(tzinfo=ZoneInfo(US_TIMEZONES[yt_tz_label]))
+                    utc_dt = local_dt.astimezone(ZoneInfo("UTC"))
+                    publish_at_iso = utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                    yt_client_id = get_secret("YOUTUBE_CLIENT_ID")
+                    yt_client_secret = get_secret("YOUTUBE_CLIENT_SECRET")
+                    yt_refresh_token = get_secret("YOUTUBE_REFRESH_TOKEN")
+
+                    upload_bar = st.progress(0.0)
+                    upload_status = st.empty()
+
+                    def on_upload_progress(fraction):
+                        upload_bar.progress(min(fraction, 1.0))
+                        upload_status.caption(f"Uploading — {fraction * 100:.0f}%")
+
+                    video_id, video_url = youtube_uploader.upload_video(
+                        active_video_path, yt_title, yt_description, yt_tags,
+                        YT_CATEGORIES[yt_category_label], yt_made_for_kids, publish_at_iso,
+                        yt_client_id, yt_client_secret, yt_refresh_token,
+                        progress_callback=on_upload_progress,
+                    )
+                    st.success(f"Uploaded — scheduled to go live {yt_date} at {yt_time.strftime('%I:%M %p')} "
+                               f"{yt_tz_label} ({publish_at_iso} UTC).")
+                    st.markdown(f"[View on YouTube (private until scheduled time)]({video_url})")
+                except Exception as e:
+                    st.error(f"Upload failed: {e}")
