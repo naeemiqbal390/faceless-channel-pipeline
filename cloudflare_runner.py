@@ -302,7 +302,8 @@ def _classify_error(err_text):
     if "429" in err_text or "too many requests" in lowered or "rate limit" in lowered:
         return "rate_limit"
     if any(tok in lowered for tok in
-           ["3003", "3004", "not found", "no such model", "unsupported", "not available", "404"]):
+           ["3003", "3004", "not found", "no such model", "unsupported", "not available", "404",
+            "5006", "must have required", "additional propert", "invalid input", "schema"]):
         return "model_unavailable"
     return "other"
 
@@ -323,7 +324,6 @@ def _attempt_generate(account_id, api_token, model_name, prompt_text, negative_p
         payload = {
             "prompt": prompt_text[:FLUX_MAX_PROMPT_CHARS],
             "steps": FLUX_STEPS,
-            "seed": random.randint(1, 2_147_483_647),
         }
     else:
         payload = {
