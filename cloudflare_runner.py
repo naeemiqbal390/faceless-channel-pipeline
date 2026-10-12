@@ -10,6 +10,12 @@ process — structurally a different (higher-detail, better-delineated)
 trade-off, at the cost of being slower and metered by a daily quota rather
 than Pollinations' confusing one-time Pollen credit.
 
+UPDATE (current design): Flux-schnell is now the PRIMARY model, chosen so a
+full ~180-image video fits in one click. Phoenix/SDXL cost far more Neurons
+per image and all Cloudflare models share the same daily pool, so a
+best-first chain through them cannot finish a video in one day. The notes
+below describe the original SDXL-first design and are kept for context.
+
 THE QUOTA: 10,000 free Neurons/day, no credit card, resetting at 00:00 UTC.
 Full-step SDXL costs meaningfully more Neurons per image than a 4-step
 model — expect on the rough order of 40-50 SDXL images per day before the
@@ -48,11 +54,19 @@ RUNS_DIR = os.path.join(tempfile.gettempdir(), "pipeline_runs")
 
 API_BASE = "https://api.cloudflare.com/client/v4/accounts"
 
+# Order matters. All Cloudflare models draw from ONE shared 10,000 Neuron/day
+# pool, so the primary must be cheap enough to finish a whole video in a
+# single run. Flux-schnell (~60 Neurons/image by Cloudflare's published
+# pricing) is that model; Phoenix (hundreds of Neurons/image) is not.
+# SDXL is only a fallback if Flux itself is unavailable on the account.
 MODEL_CANDIDATES = [
-    "@cf/leonardo/phoenix-1.0",
-    "@cf/stabilityai/stable-diffusion-xl-base-1.0",
     "@cf/black-forest-labs/flux-1-schnell",
+    "@cf/stabilityai/stable-diffusion-xl-base-1.0",
 ]
+
+FLUX_MODEL = "@cf/black-forest-labs/flux-1-schnell"
+FLUX_STEPS = 4            # documented default; max is 8 (each step costs Neurons)
+FLUX_MAX_PROMPT_CHARS = 2000   # API limit is 2048
 
 RETRY_ROUNDS = 3
 
@@ -302,17 +316,44 @@ def _attempt_generate(account_id, api_token, model_name, prompt_text, negative_p
 
     url = f"{API_BASE}/{account_id}/ai/run/{model_name}"
     headers = {"Authorization": f"Bearer {api_token}"}
-    payload = {
-        "prompt": prompt_text,
-        "negative_prompt": negative_prompt,
-        "width": IMAGE_WIDTH,
-        "height": IMAGE_HEIGHT,
-        "num_steps": NUM_STEPS,
-        "guidance": 7.5,
-        "seed": random.randint(1, 2_147_483_647),
-    }
+
+    if model_name == FLUX_MODEL:
+        # Flux-schnell accepts only prompt / steps / seed — no negative
+        # prompt, no width/height — and has a 2048-char prompt limit.
+        payload = {
+            "prompt": prompt_text[:FLUX_MAX_PROMPT_CHARS],
+            "steps": FLUX_STEPS,
+            "seed": random.randint(1, 2_147_483_647),
+        }
+    else:
+        payload = {
+            "prompt": prompt_text,
+            "negative_prompt": negative_prompt,
+            "width": IMAGE_WIDTH,
+            "height": IMAGE_HEIGHT,
+            "num_steps": NUM_STEPS,
+            "guidance": 7.5,
+            "seed": random.randint(1, 2_147_483_647),
+        }
 
     response = requests.post(url, headers=headers, json=payload, timeout=120)
+
+    # Flux returns JSON {"result": {"image": "<base64>"}, "success": true}
+    # rather than raw image bytes.
+    if "json" in response.headers.get("content-type", ""):
+        try:
+            body = response.json()
+            b64 = (body.get("result") or {}).get("image") or body.get("image")
+        except Exception:
+            b64 = None
+        if b64:
+            import base64
+            raw = base64.b64decode(b64)
+            if len(raw) < MIN_VALID_IMAGE_BYTES:
+                raise RuntimeError(f"response too small to be a real image ({len(raw)} bytes)")
+            with open(out_path, "wb") as f:
+                f.write(raw)
+            return True
 
     content_type = response.headers.get("content-type", "")
     if content_type.startswith("image/"):
