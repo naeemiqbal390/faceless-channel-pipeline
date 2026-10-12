@@ -11,6 +11,7 @@ import uuid
 import hashlib
 import tempfile
 import asyncio
+import time
 from difflib import SequenceMatcher
 
 import streamlit as st
@@ -200,6 +201,49 @@ def parse_script_scenes(raw):
     return scenes
 
 
+PIPER_MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high/en_US-ryan-high.onnx"
+
+
+def _generate_audio_piper(chunks, work_dir, progress_callback, total_chunks, edge_error):
+    import subprocess, sys, requests
+    model_path = os.path.join(tempfile.gettempdir(), "piper_en_US-ryan-high.onnx")
+    for url, path in ((PIPER_MODEL_URL, model_path), (PIPER_MODEL_URL + ".json", model_path + ".json")):
+        if not os.path.exists(path):
+            r = requests.get(url, timeout=300)
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                f.write(r.content)
+
+    wav_paths = []
+    for i, chunk in enumerate(chunks):
+        text = " ".join(s["narration"] for s in chunk if s["narration"]).strip()
+        if not text:
+            continue
+        txt_path = os.path.join(work_dir, f"piper_chunk_{i}.txt")
+        wav_path = os.path.join(work_dir, f"piper_chunk_{i}.wav")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        proc = subprocess.run(
+            [sys.executable, "-m", "piper", "-m", model_path, "-i", txt_path, "-f", wav_path],
+            capture_output=True, text=True)
+        if proc.returncode != 0 or not os.path.exists(wav_path):
+            raise RuntimeError(
+                f"Edge-TTS failed ({edge_error}) and the backup voice failed too: {proc.stderr[-400:]}")
+        wav_paths.append(wav_path)
+        if progress_callback:
+            progress_callback(i + 1, total_chunks)
+
+    list_path = os.path.join(work_dir, "piper_concat.txt")
+    with open(list_path, "w") as f:
+        for wp in wav_paths:
+            f.write(f"file '{wp}'\n")
+    out_path = os.path.join(work_dir, "narration.mp3")
+    subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+                    "-c:a", "libmp3lame", "-b:a", "192k", out_path],
+                   check=True, capture_output=True)
+    return out_path
+
+
 def generate_audio_file(script_text, voice, progress_callback=None, scenes_per_chunk=7, work_dir=None):
     scenes = parse_script_scenes(script_text)
     if not scenes:
@@ -212,6 +256,7 @@ def generate_audio_file(script_text, voice, progress_callback=None, scenes_per_c
     import edge_tts
 
     chunk_paths = []
+    edge_failed = None
     for i, chunk in enumerate(chunks):
         chunk_text = " ".join(s["narration"] for s in chunk if s["narration"])
         if not chunk_text.strip():
@@ -222,11 +267,30 @@ def generate_audio_file(script_text, voice, progress_callback=None, scenes_per_c
             communicate = edge_tts.Communicate(text, voice)
             await communicate.save(path)
 
-        asyncio.run(_gen())
+        # Microsoft's endpoint sometimes answers 403 transiently (or blocks a
+        # cloud IP for a while) — retry with growing waits before giving up.
+        last_err = None
+        for wait in (0, 5, 15, 30, 60):
+            if wait:
+                time.sleep(wait)
+            try:
+                asyncio.run(_gen())
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+        if last_err is not None:
+            edge_failed = last_err
+            break
         chunk_paths.append(chunk_path)
 
         if progress_callback:
             progress_callback(i + 1, total_chunks)
+
+    if edge_failed is not None:
+        # Edge-TTS is refusing this server. Fall back to Piper (offline
+        # neural voice) for the WHOLE narration so the voice stays consistent.
+        return _generate_audio_piper(chunks, work_dir, progress_callback, total_chunks, edge_failed)
 
     out_path = os.path.join(work_dir, "narration.mp3")
     with open(out_path, "wb") as outfile:
