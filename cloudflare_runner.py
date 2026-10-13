@@ -115,25 +115,49 @@ UNIVERSAL_NEGATIVE = (
 STYLE_PRESETS = {
     "Stick Figure": {
         "prompt": (
-            "Extremely simple 2D vector clip-art icon. Pure white flat "
-            "background. A minimalist stick-figure character made of thin, "
-            "uniform, solid black ink outlines only: a plain circle for the "
-            "head, straight simple lines for the body and limbs. Flat "
-            "graphic design, like a pictogram or clipart icon. Scene: "
+            "Simple hand-drawn stick figure illustration, whiteboard-animation "
+            "look. One stick figure with a round white head, a bold even black "
+            "outline, two small solid black dot eyes, a tiny line mouth and a "
+            "clear simple expression. Thin straight black line body, arms and "
+            "legs all the same stroke width, hands and feet as small hooked "
+            "lines with no fingers, long slim proportions. Clean off-white "
+            "paper background with a faint paper texture and lots of empty "
+            "space. At most one or two simple props drawn in the same black "
+            "line, with one flat accent color only if needed (red, yellow or "
+            "green). A thin ground line with a soft grey shadow when the "
+            "figure stands. Flat minimalist drawing, no shading, no gradients, "
+            "no background scenery. Scene: "
         ),
         "negative": (
             "photorealistic, 3d render, realistic skin, realistic anatomy, "
             "shading, gradient, painting, watercolor, airbrush, soft focus, "
-            "blurry, textured, abstract, amorphous blob, noise, complex "
-            "detail, photography, cinematic lighting, film grain"
+            "blurry, abstract, amorphous blob, noise, complex detail, "
+            "photography, cinematic lighting, film grain, colored clothing, "
+            "detailed face, nose, ears, hair, fingers, muscles, realistic "
+            "human, anime, cartoon character with detailed features, busy "
+            "background, scenery, multiple figures merged together"
         ),
     },
     "Anime / Hand-Painted (Ghibli-inspired)": {
         "prompt": (
-            "Hand-painted 2D anime background art, soft watercolor palette, "
-            "whimsical storybook atmosphere, warm natural lighting. Scene: "
+            "Hand-painted 2D animated-film still in a soft, warm, "
+            "Ghibli-inspired style. Gentle watercolor-like painted "
+            "backgrounds with rich natural greens, bright blue skies and "
+            "puffy white cumulus clouds, or warm earthy interiors in muted "
+            "ochre, brown and olive. Characters have simple clean thin dark "
+            "outlines, large expressive eyes with a small highlight, "
+            "natural everyday proportions, soft flat cel shading and "
+            "slightly muted warm colors. Calm storybook atmosphere, soft "
+            "natural light, detailed painterly backgrounds, one clear "
+            "focal subject. Scene: "
         ),
-        "negative": "photorealistic, 3d render, photography, blurry, low detail, abstract",
+        "negative": (
+            "photorealistic, 3d render, cgi, photography, western cartoon, "
+            "comic book, heavy black outlines, harsh shading, neon colors, "
+            "oversaturated, glossy, airbrushed, chibi, sexualized, "
+            "exaggerated anatomy, overly detailed face, blurry, low detail, "
+            "abstract"
+        ),
     },
     "1980s Retro Anime": {
         "prompt": (
