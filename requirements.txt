@@ -6,3 +6,4 @@ av>=11,<19
 requests>=2.31.0
 boto3>=1.34.0
 piper-tts>=1.2.0
+pillow>=10.1.0
