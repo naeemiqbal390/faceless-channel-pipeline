@@ -126,6 +126,134 @@ def upload_to_project(local_path, relative_name):
         pass
 
 
+def save_script_to_b2(script_text):
+    """
+    Saves the script itself plus a 'latest project' pointer to B2, so that
+    after a reboot the app can reopen the last project WITHOUT the script
+    being pasted again. Best-effort: never raises.
+    """
+    try:
+        import b2_storage
+        if not script_text or not b2_storage.is_configured():
+            return
+        project_id = compute_project_id(script_text)
+        tmp_dir = get_session_temp_dir()
+        script_file = os.path.join(tmp_dir, "script.txt")
+        with open(script_file, "w", encoding="utf-8") as f:
+            f.write(script_text)
+        b2_storage.upload_file(script_file, f"projects/{project_id}/script.txt")
+        pointer_file = os.path.join(tmp_dir, "_latest.json")
+        with open(pointer_file, "w", encoding="utf-8") as f:
+            json.dump({"project_id": project_id, "updated": time.time()}, f)
+        b2_storage.upload_file(pointer_file, "projects/_latest.json")
+    except Exception:
+        pass
+
+
+def autoload_last_project():
+    """
+    Runs once per browser session. If this session has no script yet and B2
+    holds a 'latest project' pointer, restore that project (script, audio,
+    manifest, images, video) so the app opens exactly where it was left.
+    """
+    if st.session_state.get("autoload_done"):
+        return
+    st.session_state["autoload_done"] = True
+    if st.session_state.get("script_text"):
+        return
+    try:
+        import b2_storage
+        if not b2_storage.is_configured():
+            return
+        pointer_local = os.path.join(get_session_temp_dir(), "_latest.json")
+        if not b2_storage.download_file("projects/_latest.json", pointer_local):
+            return
+        with open(pointer_local, "r", encoding="utf-8") as f:
+            project_id = json.load(f).get("project_id")
+        if not project_id:
+            return
+        script_local = os.path.join(get_session_temp_dir(), "script_restored.txt")
+        if not b2_storage.download_file(f"projects/{project_id}/script.txt", script_local):
+            return
+        with open(script_local, "r", encoding="utf-8") as f:
+            st.session_state["script_text"] = f.read()
+        with st.spinner("Restoring your last project from B2..."):
+            resume_project_from_b2(project_id)
+        st.session_state["autoloaded_project"] = project_id
+    except Exception as e:
+        print(f"[autoload] could not restore last project: {e}", flush=True)
+
+
+def build_srt(script_text, manifest_path):
+    """
+    Builds an .srt caption file from the script's narration and the manifest's
+    scene start times. Each scene's text is split into short caption lines;
+    the scene's time window (its start to the next scene's start) is shared
+    out in proportion to text length. Word-level timing isn't stored, so
+    caption breaks are approximate to within a second or so.
+    """
+    scenes = {sc["scene_id"]: sc["narration"] for sc in parse_script_scenes(script_text)}
+    df = pd.read_csv(manifest_path, encoding="utf-8-sig")
+    df.columns = df.columns.astype(str).str.strip().str.lower()
+
+    def to_sec(v):
+        try:
+            h, m, sec = str(v).split(":")
+            return int(h) * 3600 + int(m) * 60 + float(sec)
+        except Exception:
+            return None
+
+    rows = []
+    for i, row in df.reset_index(drop=True).iterrows():
+        try:
+            sid = int(row["scene_id"])
+        except Exception:
+            sid = i + 1
+        rows.append((sid, to_sec(row.get("start_time")), to_sec(row.get("end_time"))))
+
+    def fmt(t):
+        t = max(0.0, t)
+        ms = int(round(t * 1000))
+        return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+
+    def split_caption_lines(text, max_chars=84):
+        words, chunks, cur = text.split(), [], ""
+        for w in words:
+            if cur and len(cur) + 1 + len(w) > max_chars:
+                chunks.append(cur)
+                cur = w
+            else:
+                cur = (cur + " " + w).strip()
+        if cur:
+            chunks.append(cur)
+        return chunks
+
+    def two_lines(chunk, width=42):
+        if len(chunk) <= width:
+            return chunk
+        mid = chunk.rfind(" ", 0, width + 1)
+        return chunk if mid <= 0 else chunk[:mid] + "\n" + chunk[mid + 1:]
+
+    out, n = [], 1
+    for idx, (sid, start, end) in enumerate(rows):
+        text = (scenes.get(sid) or "").strip()
+        if not text or start is None:
+            continue
+        nxt = rows[idx + 1][1] if idx + 1 < len(rows) and rows[idx + 1][1] is not None else None
+        window_end = nxt if nxt is not None else (end if end is not None else start + 4.0)
+        if window_end <= start:
+            window_end = start + 2.0
+        chunks = split_caption_lines(text)
+        total_chars = sum(len(c) for c in chunks) or 1
+        t = start
+        for c in chunks:
+            dur = (window_end - start) * len(c) / total_chars
+            out.append(f"{n}\n{fmt(t)} --> {fmt(t + dur)}\n{two_lines(c)}\n")
+            n += 1
+            t += dur
+    return "\n".join(out)
+
+
 def force_fix_manifest_csv(csv_path):
     """Guarantees schema normalization directly prior to triggering background execution."""
     try:
@@ -209,6 +337,7 @@ def _generate_audio_piper(chunks, work_dir, progress_callback, total_chunks, edg
     model_path = os.path.join(tempfile.gettempdir(), "piper_en_US-ryan-high.onnx")
     for url, path in ((PIPER_MODEL_URL, model_path), (PIPER_MODEL_URL + ".json", model_path + ".json")):
         if not os.path.exists(path):
+            print(f"[audio] downloading backup voice file: {url}", flush=True)
             r = requests.get(url, timeout=300)
             r.raise_for_status()
             with open(path, "wb") as f:
@@ -270,7 +399,7 @@ def generate_audio_file(script_text, voice, progress_callback=None, scenes_per_c
         # Microsoft's endpoint sometimes answers 403 transiently (or blocks a
         # cloud IP for a while) — retry with growing waits before giving up.
         last_err = None
-        for wait in (0, 5, 15, 30, 60):
+        for wait in (0, 2, 5):
             if wait:
                 time.sleep(wait)
             try:
@@ -279,8 +408,10 @@ def generate_audio_file(script_text, voice, progress_callback=None, scenes_per_c
                 break
             except Exception as e:
                 last_err = e
+                print(f"[audio] Edge-TTS chunk {i} failed: {str(e)[:150]}", flush=True)
         if last_err is not None:
             edge_failed = last_err
+            print("[audio] Edge-TTS is blocked — switching to backup voice (Piper).", flush=True)
             break
         chunk_paths.append(chunk_path)
 
@@ -422,8 +553,12 @@ st.caption("Stick-figure style · unlimited characters · zero cost")
 if "manifest_path" not in st.session_state:
     st.session_state["manifest_path"] = None
 
-tab0, tab_audio, tab_align, tab_images, tab_video = st.tabs(
-    ["1. Paste script", "2. Audio", "3. Align", "4. Images", "5. Video"]
+autoload_last_project()
+if st.session_state.get("autoloaded_project"):
+    st.success("Reopened your last project exactly where you left it. Use the tabs below to continue.")
+
+tab0, tab_audio, tab_align, tab_images, tab_video, tab_thumb = st.tabs(
+    ["1. Paste script", "2. Audio", "3. Align", "4. Images", "5. Video", "6. Thumbnail"]
 )
 
 with tab0:
@@ -435,6 +570,7 @@ with tab0:
             st.warning("No [SCENE N: ...] markers found in script input.")
         else:
             st.session_state["script_text"] = pasted_script
+            save_script_to_b2(pasted_script)
             scene_count = len(re.findall(r"\[SCENE", pasted_script))
             narration_only = re.sub(r"\[SCENE.*?\]\n?", "", pasted_script, flags=re.DOTALL)
             word_count = len(re.findall(r"\S+", narration_only))
@@ -464,6 +600,11 @@ with tab0:
                     st.success("Progress restored — shown below.")
                 if clear_col.button("Clear saved progress — back to stage 1"):
                     b2_storage.delete_prefix(f"projects/{check_project_id}/")
+                    try:
+                        b2_storage.delete_prefix("projects/_latest.json")
+                    except Exception:
+                        pass
+                    st.session_state["autoload_done"] = True
                     for key in ["script_text", "audio_path", "manifest_path", "images_dir",
                                 "video_path", "project_id"]:
                         st.session_state.pop(key, None)
@@ -521,6 +662,7 @@ with tab0:
             st.warning("No [SCENE N: ...] markers found.")
         else:
             st.session_state["script_text"] = pasted_script
+            save_script_to_b2(pasted_script)
             try:
                 st.markdown("**Step 1/4 — audio**")
                 audio_bar = st.progress(0.0)
@@ -893,3 +1035,77 @@ with tab_video:
         with open(st.session_state["video_path"], "rb") as f:
             st.download_button("Download final_video.mp4", f, file_name="final_video.mp4", mime="video/mp4",
                                 key="dl_video_tab")
+
+    st.markdown("#### Captions (.srt)")
+    st.caption("YouTube also makes automatic captions on its own after upload (usually within minutes to a few "
+               "hours), but they can misspell names and terms. This file is built from your own script, so the "
+               "wording is exact. In YouTube Studio: Subtitles > Add language > Upload file > With timing.")
+    _script_for_srt = st.session_state.get("script_text", "")
+    _manifest_for_srt = st.session_state.get("manifest_path")
+    if _script_for_srt and _manifest_for_srt and os.path.exists(_manifest_for_srt):
+        try:
+            srt_text = build_srt(_script_for_srt, _manifest_for_srt)
+            st.download_button("Download captions.srt", srt_text.encode("utf-8"), file_name="captions.srt",
+                               mime="application/x-subrip", key="dl_srt_tab")
+        except Exception as e:
+            st.warning(f"Could not build captions: {e}")
+    else:
+        st.caption("Captions appear here once the script and alignment manifest are loaded.")
+
+
+with tab_thumb:
+    st.markdown("### Thumbnail")
+    st.caption("Pick one of your generated scene images and add a short headline. The text is drawn by the app "
+               "(not the image model), so it is always spelled correctly. You get 3 layouts, matching YouTube's "
+               "\"Test & compare\" limit of 3 thumbnails. Output: 1280x720 JPG under 2 MB.")
+
+    import thumbnail_maker
+    thumb_manifest = st.session_state.get("manifest_path")
+    scene_files = {}
+    if thumb_manifest and os.path.exists(thumb_manifest):
+        import cloudflare_runner
+        thumb_images_dir = cloudflare_runner.get_images_dir(thumb_manifest)
+        if os.path.isdir(thumb_images_dir):
+            for fname in sorted(os.listdir(thumb_images_dir)):
+                m = re.match(r"scene_(\d+)\.(png|jpg|jpeg)$", fname)
+                if m:
+                    scene_files[int(m.group(1))] = os.path.join(thumb_images_dir, fname)
+
+    source_path = None
+    uploaded_thumb_src = st.file_uploader("Or upload your own picture", type=["png", "jpg", "jpeg"], key="thumb_upload")
+    if uploaded_thumb_src is not None:
+        source_path = os.path.join(get_session_temp_dir(), "thumb_source_upload")
+        with open(source_path, "wb") as f:
+            f.write(uploaded_thumb_src.read())
+    elif scene_files:
+        chosen_scene = st.selectbox("Scene image to use", sorted(scene_files), key="thumb_scene")
+        source_path = scene_files[chosen_scene]
+        st.image(source_path, width=220)
+    else:
+        st.info("No scene images found yet. Generate images first, or upload a picture above.")
+
+    headline = st.text_input("Headline (2-4 words works best)", value="NO DENTIST?", key="thumb_headline")
+    keyword = st.text_input("Word(s) to show in red", value="DENTIST", key="thumb_keyword")
+
+    if st.button("Make thumbnails", type="primary", key="thumb_make"):
+        if not source_path:
+            st.error("Choose or upload a picture first.")
+        elif not headline.strip():
+            st.error("Enter a headline.")
+        else:
+            try:
+                made = []
+                for layout in thumbnail_maker.LAYOUTS:
+                    out = os.path.join(get_session_temp_dir(), f"thumbnail_{layout}.jpg")
+                    thumbnail_maker.make_thumbnail(source_path, headline, keyword, out, layout)
+                    made.append((layout, out))
+                st.session_state["thumbnails"] = made
+            except Exception as e:
+                st.error(f"Thumbnail failed: {e}")
+
+    for layout, path in st.session_state.get("thumbnails", []):
+        if os.path.exists(path):
+            st.image(path, caption=layout, width="stretch")
+            with open(path, "rb") as f:
+                st.download_button(f"Download {layout}.jpg", f, file_name=f"thumbnail_{layout}.jpg",
+                                   mime="image/jpeg", key=f"dl_thumb_{layout}")
