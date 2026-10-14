@@ -597,9 +597,16 @@ def make_progress_log(container, max_lines_shown=40):
     """
     lines = []
 
+    shown = {"t": 0.0}
+
     def _log(message):
         lines.append(message)
         print(message, flush=True)
+        # fewer UI pushes = less load on the free host; the full log still goes to the console
+        now = time.time()
+        if now - shown["t"] < 1.0 and "quota" not in message.lower() and "Switch" not in message:
+            return
+        shown["t"] = now
         try:
             container.code("\n".join(lines[-max_lines_shown:]), language=None, wrap_lines=True)
         except TypeError:
@@ -634,9 +641,9 @@ def make_image_gallery(container, images_dir, cols=5, max_shown=15):
         try:
             with Image.open(path) as im:
                 im = im.convert("RGB")
-                im.thumbnail((360, 360))
+                im.thumbnail((260, 260))
                 buf = io.BytesIO()
-                im.save(buf, "JPEG", quality=80)
+                im.save(buf, "JPEG", quality=70)
             data = base64.b64encode(buf.getvalue()).decode("ascii")
         except Exception:
             return None
@@ -645,7 +652,15 @@ def make_image_gallery(container, images_dir, cols=5, max_shown=15):
         cache[key] = data
         return data
 
-    def _refresh():
+    last = {"t": 0.0}
+
+    def _refresh(force=False):
+        # Redrawing the gallery on every log line floods the browser connection
+        # and burns CPU on the free host, so redraw at most every few seconds.
+        now = time.time()
+        if not force and last["t"] and now - last["t"] < 8:
+            return
+        last["t"] = now
         try:
             entries = []
             for f in os.listdir(images_dir):
@@ -791,6 +806,8 @@ with tab0:
                                     mime="video/mp4", key="dl_video_tab0_status")
 
     st.divider()
+    st.checkbox("Show live image gallery while generating (turn off if the app gets throttled)",
+                value=True, key="show_live_gallery")
     voice_auto = st.selectbox("Voice", EDGE_TTS_VOICES, key="voice_auto")
 
     import cloudflare_runner
@@ -878,6 +895,9 @@ with tab0:
                     st.caption("Generated so far (most recent):")
                     gallery_placeholder = st.empty()
                 refresh_gallery = make_image_gallery(gallery_placeholder, images_dir_preview)
+                if not st.session_state.get("show_live_gallery", True):
+                    _g = refresh_gallery
+                    refresh_gallery = lambda force=False: (_g(force=True) if force else None)
                 refresh_gallery()
 
                 def on_image_progress(done_images, total_images, message):
@@ -897,6 +917,7 @@ with tab0:
                     accounts=cloudflare_accounts,
                 )
                 st.session_state["images_dir"] = images_dir
+                refresh_gallery(force=True)
                 sync_images_to_b2(images_dir)
                 _status = cloudflare_runner.get_resume_status(active_manifest)
                 _missing = _status["total_images"] - _status["done_images"]
@@ -1092,6 +1113,9 @@ with tab_images:
                     st.caption("Generated so far (most recent):")
                     gallery_placeholder = st.empty()
                 refresh_gallery = make_image_gallery(gallery_placeholder, images_dir_preview)
+                if not st.session_state.get("show_live_gallery", True):
+                    _g = refresh_gallery
+                    refresh_gallery = lambda force=False: (_g(force=True) if force else None)
                 refresh_gallery()
 
                 def on_image_progress(done_images, total_images, message):
@@ -1112,6 +1136,7 @@ with tab_images:
                 )
                 st.session_state["images_dir"] = images_dir
 
+                refresh_gallery(force=True)
                 sync_images_to_b2(images_dir)
                 _status = cloudflare_runner.get_resume_status(active_manifest_path)
                 _missing = _status["total_images"] - _status["done_images"]
