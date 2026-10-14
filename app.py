@@ -525,22 +525,64 @@ def make_image_gallery(container, images_dir, cols=5, max_shown=15):
     directory fresh each call rather than tracking state, since
     cloudflare_runner writes deterministic scene_NNN.png filenames.
     """
+    import base64
+    import io
+    from PIL import Image
+
+    cache = st.session_state.setdefault("_thumb_cache", {})
+
+    def _thumb_b64(path):
+        # Keyed by path + mtime + size so a changed file can never show a stale thumbnail.
+        try:
+            st_info = os.stat(path)
+            key = (path, st_info.st_mtime_ns, st_info.st_size)
+        except OSError:
+            return None
+        if key in cache:
+            return cache[key]
+        try:
+            with Image.open(path) as im:
+                im = im.convert("RGB")
+                im.thumbnail((360, 360))
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=80)
+            data = base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception:
+            return None
+        if len(cache) > 400:
+            cache.clear()
+        cache[key] = data
+        return data
+
     def _refresh():
         try:
-            files = sorted(f for f in os.listdir(images_dir) if f.lower().endswith(".png"))
+            entries = []
+            for f in os.listdir(images_dir):
+                if f.lower().endswith(".png"):
+                    p = os.path.join(images_dir, f)
+                    entries.append((os.path.getmtime(p), f))
+            entries.sort()
         except Exception:
-            files = []
-        recent = files[-max_shown:]
-        with container.container():
-            if not recent:
-                st.caption("Images will appear here as they're generated.")
-                return
-            rows = [recent[i:i + cols] for i in range(0, len(recent), cols)]
-            for row in rows:
-                row_cols = st.columns(cols)
-                for cell, fname in zip(row_cols, row):
-                    cell.image(os.path.join(images_dir, fname), width="stretch",
-                               caption=fname.replace(".png", ""))
+            entries = []
+        # most recently generated images, shown newest first
+        recent = [f for _, f in entries[-max_shown:]][::-1]
+        if not recent:
+            container.caption("Images will appear here as they're generated.")
+            return
+        cells = []
+        for fname in recent:
+            b64 = _thumb_b64(os.path.join(images_dir, fname))
+            if not b64:
+                continue
+            cells.append(
+                '<div style="text-align:center;font-size:12px">'
+                f'<img src="data:image/jpeg;base64,{b64}" '
+                'style="width:100%;border-radius:6px;display:block"/>'
+                f'{fname.replace(".png", "")}</div>'
+            )
+        html = (f'<div style="display:grid;grid-template-columns:repeat({cols},1fr);gap:8px">'
+                + "".join(cells) + "</div>")
+        container.markdown(html, unsafe_allow_html=True)
 
     return _refresh
 
@@ -745,12 +787,22 @@ with tab0:
                     account_id=cloudflare_account,
                 )
                 st.session_state["images_dir"] = images_dir
+                _status = cloudflare_runner.get_resume_status(active_manifest)
+                _missing = _status["total_images"] - _status["done_images"]
+                if _missing > 0 or failed_scenes:
+                    image_bar.progress(min(_status["done_images"] / max(_status["total_images"], 1), 1.0))
+                    st.error(
+                        f"Stopped before the video: {_status['done_images']}/{_status['total_images']} images are done, "
+                        f"{_missing} still missing (likely today's free Cloudflare quota ran out). "
+                        f"Nothing is lost — everything is saved. Come back after 05:00 Pakistan time "
+                        f"(00:00 UTC, when the quota resets), reopen the app and press Resume. "
+                        f"The video will only be built once ALL images exist.")
+                    with open(zip_path, "rb") as f:
+                        st.download_button("Download images so far (zip)", f, file_name="scene_images_batch.zip",
+                                            mime="application/zip", key="dl_images_pipeline_partial")
+                    st.stop()
                 image_bar.progress(1.0)
-                if failed_scenes:
-                    st.warning(f"{len(failed_scenes)} scenes failed and were skipped: {failed_scenes}. "
-                               f"Re-run image generation to retry just those.")
-                else:
-                    st.success("All images generated.")
+                st.success("All images generated.")
                 with open(zip_path, "rb") as f:
                     st.download_button("Download scene_images_batch.zip", f, file_name="scene_images_batch.zip",
                                         mime="application/zip", key="dl_images_pipeline")
@@ -947,11 +999,17 @@ with tab_images:
                 )
                 st.session_state["images_dir"] = images_dir
 
-                image_bar.progress(1.0)
-                if failed_scenes:
-                    st.warning(f"{len(failed_scenes)} scenes failed and were skipped: {failed_scenes}. "
-                               f"Click Generate Images again to retry just those — completed scenes won't be redone.")
+                _status = cloudflare_runner.get_resume_status(active_manifest_path)
+                _missing = _status["total_images"] - _status["done_images"]
+                if _missing > 0 or failed_scenes:
+                    image_bar.progress(min(_status["done_images"] / max(_status["total_images"], 1), 1.0))
+                    st.error(
+                        f"{_status['done_images']}/{_status['total_images']} images done, {_missing} missing "
+                        f"(likely today's free quota ran out). Everything is saved. After 05:00 Pakistan time "
+                        f"(00:00 UTC) click Generate Images again — only the missing ones are made. "
+                        f"The video cannot be built until all images exist.")
                 else:
+                    image_bar.progress(1.0)
                     st.success("All images generated successfully!")
 
                 with open(zip_path, "rb") as f:
@@ -998,6 +1056,10 @@ with tab_video:
             st.error("Missing scene manifest.")
         elif not active_audio_for_video or not os.path.exists(active_audio_for_video):
             st.error("Missing narration audio.")
+        elif resume_info["done_images"] < resume_info["total_images"]:
+            st.error(f"Cannot build the video yet: {resume_info['total_images'] - resume_info['done_images']} "
+                     f"of {resume_info['total_images']} images are still missing. Finish them in the Images tab "
+                     f"(after 05:00 Pakistan time when the quota resets), then assemble.")
         else:
             try:
                 video_bar = st.progress(0.0)
