@@ -68,19 +68,22 @@ def get_project_status(project_id):
 
 def resume_project_from_b2(project_id):
     """Downloads every saved artifact for this project into the current
-    session's local workspace and restores session_state to match, so the
-    rest of the app picks up exactly where it left off — including image
-    generation, since cloudflare_runner's own skip-if-exists resume logic
-    then sees these files as already done."""
+    session's local workspace and restores session_state to match.
+    Returns a summary dict that the UI shows, so a restore is never silent.
+    A saved video is only restored if EVERY scene image exists; a video built
+    from an incomplete image set is stale, so it is discarded."""
     import b2_storage
     session_dir = get_session_temp_dir()
     prefix = f"projects/{project_id}/"
+    summary = {"audio": False, "manifest": False, "total": 0, "have": 0,
+               "download_failed": 0, "video": False, "video_discarded": False}
 
     audio_key = prefix + "narration.mp3"
     if b2_storage.key_exists(audio_key):
         local_audio = os.path.join(session_dir, "narration.mp3")
         if b2_storage.download_file(audio_key, local_audio):
             st.session_state["audio_path"] = local_audio
+            summary["audio"] = True
 
     manifest_key = prefix + "scene_manifest.csv"
     local_manifest = None
@@ -88,23 +91,86 @@ def resume_project_from_b2(project_id):
         local_manifest = os.path.join(session_dir, "scene_manifest.csv")
         if b2_storage.download_file(manifest_key, local_manifest):
             st.session_state["manifest_path"] = local_manifest
+            summary["manifest"] = True
+        else:
+            local_manifest = None
 
     if local_manifest:
         import cloudflare_runner
         images_dir = cloudflare_runner.get_images_dir(local_manifest)
         image_keys = [k for k in b2_storage.list_keys(prefix + "scene_images/") if k.endswith(".png")]
         for k in image_keys:
-            b2_storage.download_file(k, os.path.join(images_dir, os.path.basename(k)))
-        if image_keys:
-            st.session_state["images_dir"] = images_dir
+            dest = os.path.join(images_dir, os.path.basename(k))
+            if os.path.exists(dest):
+                continue
+            ok = b2_storage.download_file(k, dest) or b2_storage.download_file(k, dest)
+            if not ok:
+                summary["download_failed"] += 1
+        st.session_state["images_dir"] = images_dir
+        status = cloudflare_runner.get_resume_status(local_manifest)
+        summary["total"] = status["total_images"]
+        summary["have"] = status["done_images"]
 
     video_key = prefix + "final_video.mp4"
     if b2_storage.key_exists(video_key):
-        local_video = os.path.join(session_dir, "final_video.mp4")
-        if b2_storage.download_file(video_key, local_video):
-            st.session_state["video_path"] = local_video
+        complete = summary["total"] > 0 and summary["have"] >= summary["total"]
+        if complete:
+            local_video = os.path.join(session_dir, "final_video.mp4")
+            if b2_storage.download_file(video_key, local_video):
+                st.session_state["video_path"] = local_video
+                summary["video"] = True
+        else:
+            # stale video made before all images existed — remove it
+            b2_storage.delete_prefix(video_key)
+            st.session_state.pop("video_path", None)
+            summary["video_discarded"] = True
 
     st.session_state["project_id"] = project_id
+    return summary
+
+
+def sync_images_to_b2(images_dir):
+    """Uploads any local scene image that B2 doesn't have yet (with retries),
+    so a restart can never lose images that were generated. Returns count uploaded."""
+    script_text = st.session_state.get("script_text", "")
+    if not script_text or not images_dir or not os.path.isdir(images_dir):
+        return 0
+    try:
+        import b2_storage
+        if not b2_storage.is_configured():
+            return 0
+        prefix = f"projects/{compute_project_id(script_text)}/scene_images/"
+        have = {os.path.basename(k) for k in b2_storage.list_keys(prefix)}
+        uploaded = 0
+        for f in sorted(os.listdir(images_dir)):
+            if f.lower().endswith(".png") and f not in have:
+                for _ in range(3):
+                    if b2_storage.upload_file(os.path.join(images_dir, f), prefix + f):
+                        uploaded += 1
+                        break
+        return uploaded
+    except Exception:
+        return 0
+
+
+def invalidate_saved_video(manifest_path=None):
+    """Removes any previously built video (local + B2). Called whenever images
+    are still missing, because such a video is incomplete by definition."""
+    script_text = st.session_state.get("script_text", "")
+    if not script_text:
+        return
+    try:
+        if manifest_path:
+            import cloudflare_runner
+            st_ = cloudflare_runner.get_resume_status(manifest_path)
+            if st_["total_images"] and st_["done_images"] >= st_["total_images"]:
+                return  # nothing missing — a saved video is still valid
+        st.session_state.pop("video_path", None)
+        import b2_storage
+        if b2_storage.is_configured():
+            b2_storage.delete_prefix(f"projects/{compute_project_id(script_text)}/final_video.mp4")
+    except Exception:
+        pass
 
 
 def upload_to_project(local_path, relative_name):
@@ -121,7 +187,9 @@ def upload_to_project(local_path, relative_name):
         if not b2_storage.is_configured():
             return
         project_id = compute_project_id(script_text)
-        b2_storage.upload_file(local_path, f"projects/{project_id}/{relative_name}")
+        for _ in range(3):
+            if b2_storage.upload_file(local_path, f"projects/{project_id}/{relative_name}"):
+                break
     except Exception:
         pass
 
@@ -178,7 +246,7 @@ def autoload_last_project():
         with open(script_local, "r", encoding="utf-8") as f:
             st.session_state["script_text"] = f.read()
         with st.spinner("Restoring your last project from B2..."):
-            resume_project_from_b2(project_id)
+            st.session_state["resume_summary"] = resume_project_from_b2(project_id)
         st.session_state["autoloaded_project"] = project_id
     except Exception as e:
         print(f"[autoload] could not restore last project: {e}", flush=True)
@@ -532,7 +600,10 @@ def make_progress_log(container, max_lines_shown=40):
     def _log(message):
         lines.append(message)
         print(message, flush=True)
-        container.code("\n".join(lines[-max_lines_shown:]), language=None)
+        try:
+            container.code("\n".join(lines[-max_lines_shown:]), language=None, wrap_lines=True)
+        except TypeError:
+            container.code("\n".join(lines[-max_lines_shown:]), language=None)
 
     return _log
 
@@ -652,14 +723,14 @@ with tab0:
                     "audio ✓" if project_status["has_audio"] else "audio ✗",
                     "manifest ✓" if project_status["has_manifest"] else "manifest ✗",
                     f"{project_status['num_images']} images saved",
-                    "video ✓" if project_status["has_video"] else "video ✗",
+                    "video saved (checked against images on Resume)" if project_status["has_video"] else "video ✗",
                 ]
                 st.info(f"Saved progress found for this script: {', '.join(status_bits)}")
                 resume_col, clear_col = st.columns(2)
                 if resume_col.button("Resume — load saved progress", type="primary"):
                     with st.spinner("Downloading saved progress from B2..."):
-                        resume_project_from_b2(check_project_id)
-                    st.success("Progress restored — shown below.")
+                        st.session_state["resume_summary"] = resume_project_from_b2(check_project_id)
+                    st.rerun()
                 if clear_col.button("Clear saved progress — back to stage 1"):
                     b2_storage.delete_prefix(f"projects/{check_project_id}/")
                     try:
@@ -668,7 +739,7 @@ with tab0:
                         pass
                     st.session_state["autoload_done"] = True
                     for key in ["script_text", "audio_path", "manifest_path", "images_dir",
-                                "video_path", "project_id"]:
+                                "video_path", "project_id", "resume_summary"]:
                         st.session_state.pop(key, None)
                     st.success("Cleared. Starting over.")
                     st.rerun()
@@ -679,6 +750,23 @@ with tab0:
     # Shown right here, in the same tab, whenever anything is loaded —
     # right after Resume, or after any pipeline step completes — so there's
     # no need to go hunting through other tabs to confirm something worked.
+    rs = st.session_state.get("resume_summary")
+    if rs:
+        if rs["total"]:
+            missing = rs["total"] - rs["have"]
+            msg = (f"Restored: audio {'✓' if rs['audio'] else '✗'}, manifest {'✓' if rs['manifest'] else '✗'}, "
+                   f"images {rs['have']}/{rs['total']}" + (f" ({missing} still to generate)" if missing else " (complete)"))
+            (st.success if not missing else st.warning)(msg)
+        else:
+            st.warning("Restored what was saved, but no scene manifest was found yet.")
+        if rs["download_failed"]:
+            st.error(f"{rs['download_failed']} saved image(s) could not be downloaded from B2 — they will be regenerated.")
+        if rs["video_discarded"]:
+            st.info("An older video that was built before all images existed was removed. "
+                    "A fresh video is built only when every image is done.")
+        if rs["video"]:
+            st.success("Complete video restored.")
+
     has_any_status = any(st.session_state.get(k) for k in
                           ["audio_path", "manifest_path", "images_dir", "video_path"])
     if has_any_status:
@@ -801,6 +889,7 @@ with tab0:
                 def on_image_saved(scene_id, local_path):
                     upload_to_project(local_path, f"scene_images/{os.path.basename(local_path)}")
 
+                invalidate_saved_video(active_manifest)
                 images_dir, zip_path, failed_scenes = cloudflare_runner.run_image_generation(
                     active_manifest, progress_callback=on_image_progress,
                     style=st.session_state.get("image_style", cloudflare_runner.DEFAULT_STYLE),
@@ -808,6 +897,7 @@ with tab0:
                     accounts=cloudflare_accounts,
                 )
                 st.session_state["images_dir"] = images_dir
+                sync_images_to_b2(images_dir)
                 _status = cloudflare_runner.get_resume_status(active_manifest)
                 _missing = _status["total_images"] - _status["done_images"]
                 if _missing > 0 or failed_scenes:
@@ -1013,6 +1103,7 @@ with tab_images:
                 def on_image_saved(scene_id, local_path):
                     upload_to_project(local_path, f"scene_images/{os.path.basename(local_path)}")
 
+                invalidate_saved_video(active_manifest_path)
                 images_dir, zip_path, failed_scenes = cloudflare_runner.run_image_generation(
                     active_manifest_path, progress_callback=on_image_progress,
                     style=style_override,
@@ -1021,6 +1112,7 @@ with tab_images:
                 )
                 st.session_state["images_dir"] = images_dir
 
+                sync_images_to_b2(images_dir)
                 _status = cloudflare_runner.get_resume_status(active_manifest_path)
                 _missing = _status["total_images"] - _status["done_images"]
                 if _missing > 0 or failed_scenes:
