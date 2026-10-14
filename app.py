@@ -294,6 +294,26 @@ EDGE_TTS_VOICES = [
 ]
 
 
+def get_cloudflare_accounts(manual_id="", manual_token=""):
+    """
+    Ordered list of Cloudflare accounts: [(label, account_id, token), ...].
+    Order is fixed: account 1 (CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN), then
+    CLOUDFLARE_ACCOUNT_ID_2 / CLOUDFLARE_API_TOKEN_2, ... up to _6.
+    The app uses account 1 until its daily quota is gone, then moves to 2, etc.
+    """
+    accounts = []
+    first_id = get_secret(["CLOUDFLARE_ACCOUNT_ID"], manual_id)
+    first_token = get_secret(["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_KEY"], manual_token)
+    if first_id and first_token:
+        accounts.append(("Account 1", first_id, first_token))
+    for n in range(2, 7):
+        a_id = get_secret([f"CLOUDFLARE_ACCOUNT_ID_{n}"])
+        a_tok = get_secret([f"CLOUDFLARE_API_TOKEN_{n}"])
+        if a_id and a_tok:
+            accounts.append((f"Account {n}", a_id, a_tok))
+    return accounts
+
+
 def get_secret(key_names, user_input=""):
     """
     key_names can be a single string or a list of acceptable names — tries
@@ -739,13 +759,14 @@ with tab0:
 
                 st.markdown("**Step 3/4 — images**")
                 import cloudflare_runner
-                cloudflare_token = get_secret(["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_KEY"], cloudflare_token_auto)
-                cloudflare_account = get_secret(["CLOUDFLARE_ACCOUNT_ID"], cloudflare_account_auto)
-                if not cloudflare_token or not cloudflare_account:
+                cloudflare_accounts = get_cloudflare_accounts(cloudflare_account_auto, cloudflare_token_auto)
+                if not cloudflare_accounts:
                     raise ValueError(
                         "Cloudflare credentials missing — add CLOUDFLARE_ACCOUNT_ID and "
                         "CLOUDFLARE_API_TOKEN to Secrets (or enter them in the fields above)."
                     )
+                st.caption("Image account order: " + " → ".join(a[0] for a in cloudflare_accounts)
+                           + ". Each is used until its daily quota is gone, then the next takes over.")
 
                 active_manifest = st.session_state.get("manifest_path")
                 if not active_manifest or not os.path.exists(active_manifest):
@@ -781,10 +802,10 @@ with tab0:
                     upload_to_project(local_path, f"scene_images/{os.path.basename(local_path)}")
 
                 images_dir, zip_path, failed_scenes = cloudflare_runner.run_image_generation(
-                    active_manifest, cloudflare_token, progress_callback=on_image_progress,
+                    active_manifest, progress_callback=on_image_progress,
                     style=st.session_state.get("image_style", cloudflare_runner.DEFAULT_STYLE),
                     on_image_saved=on_image_saved,
-                    account_id=cloudflare_account,
+                    accounts=cloudflare_accounts,
                 )
                 st.session_state["images_dir"] = images_dir
                 _status = cloudflare_runner.get_resume_status(active_manifest)
@@ -959,13 +980,14 @@ with tab_images:
             st.error("Missing manifest file! Please upload a CSV or run alignment.")
         else:
             try:
-                cloudflare_token = get_secret(["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_KEY"], cloudflare_token_override)
-                cloudflare_account = get_secret(["CLOUDFLARE_ACCOUNT_ID"], cloudflare_account_override)
-                if not cloudflare_token or not cloudflare_account:
+                cloudflare_accounts = get_cloudflare_accounts(cloudflare_account_override, cloudflare_token_override)
+                if not cloudflare_accounts:
                     raise ValueError(
                         "Cloudflare credentials missing — add CLOUDFLARE_ACCOUNT_ID and "
                         "CLOUDFLARE_API_TOKEN to Secrets (or enter them in the fields above)."
                     )
+                st.caption("Image account order: " + " → ".join(a[0] for a in cloudflare_accounts)
+                           + ". Each is used until its daily quota is gone, then the next takes over.")
 
                 import cloudflare_runner
                 force_fix_manifest_csv(active_manifest_path)
@@ -992,10 +1014,10 @@ with tab_images:
                     upload_to_project(local_path, f"scene_images/{os.path.basename(local_path)}")
 
                 images_dir, zip_path, failed_scenes = cloudflare_runner.run_image_generation(
-                    active_manifest_path, cloudflare_token, progress_callback=on_image_progress,
+                    active_manifest_path, progress_callback=on_image_progress,
                     style=style_override,
                     on_image_saved=on_image_saved,
-                    account_id=cloudflare_account,
+                    accounts=cloudflare_accounts,
                 )
                 st.session_state["images_dir"] = images_dir
 
