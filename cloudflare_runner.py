@@ -68,7 +68,7 @@ FLUX_MODEL = "@cf/black-forest-labs/flux-1-schnell"
 FLUX_STEPS = 4            # documented default; max is 8 (each step costs Neurons)
 FLUX_MAX_PROMPT_CHARS = 2000   # API limit is 2048
 
-RETRY_ROUNDS = 3
+RETRY_ROUNDS = 5
 
 # Cloudflare's documented rate limit for these models is generous (720/min)
 # — the real constraint is the daily Neuron budget, not request pace, so
@@ -321,7 +321,10 @@ def _classify_error(err_text):
            ["authentication", "invalid token", "unauthorized", "10000", "401"]):
         return "auth_error"
     if any(tok in lowered for tok in
-           ["neuron", "quota", "daily limit", "budget"]):
+           ["3030", "nsfw", "flagged", "inappropriate", "content policy", "safety filter"]):
+        return "content_filtered"  # false positive on the PROMPT or image — fixable by rewording
+    if any(tok in lowered for tok in
+           ["neuron", "quota", "daily limit", "budget", "4006", "free allocation"]):
         return "quota_exhausted"  # account-wide — no point switching models, just park it
     if "429" in err_text or "too many requests" in lowered or "rate limit" in lowered:
         return "rate_limit"
@@ -334,6 +337,46 @@ def _classify_error(err_text):
 
 class AuthenticationError(RuntimeError):
     pass
+
+
+class ContentFilterError(RuntimeError):
+    pass
+
+
+# Gentle replacements for words that commonly trip automated image filters.
+_SOFTEN_MAP = [
+    ("dead bodies", "sleeping figures"), ("dead body", "resting figure"), ("corpses", "resting figures"),
+    ("corpse", "resting figure"), ("bodies", "figures"), ("body", "figure"),
+    ("dead", "still"), ("dying", "weary"), ("death", "loss"), ("killed", "lost"), ("kill", "stop"),
+    ("blood", "red cloth"), ("bleeding", "bandaged"), ("wounded", "bandaged"), ("wounds", "bandages"),
+    ("wound", "bandage"), ("injured", "tired"), ("injury", "bandage"), ("hurt", "tired"),
+    ("screaming", "calling out"), ("scream", "call out"), ("drowning", "struggling in rising water"),
+    ("drowned", "swept away"), ("crushed", "buried under stones"), ("burning", "glowing"),
+    ("burned", "scorched"), ("naked", "robed"), ("nude", "robed"), ("bare skin", "simple cloth"),
+    ("skeleton", "old bones"), ("skull", "old relic"), ("horror", "worry"), ("terrified", "worried"),
+    ("terror", "worry"), ("panic", "alarm"), ("violent", "powerful"), ("attack", "approach"),
+    ("fight", "struggle"), ("weapon", "tool"), ("sword", "tool"), ("spear", "long pole"),
+    ("fire", "glowing flames"), ("explosion", "huge cloud"), ("destroyed", "toppled"),
+]
+
+
+def _soften_prompt(prompt, level):
+    """
+    level 1: swap risky words for gentle ones.
+    level 2: keep only the first sentence, softened, marked family-friendly.
+    level 3: short neutral version built from the first few softened words.
+    """
+    import re
+    text = prompt
+    for bad, good in _SOFTEN_MAP:
+        text = re.sub(rf"\b{re.escape(bad)}\b", good, text, flags=re.IGNORECASE)
+    if level <= 1:
+        return text
+    first = re.split(r"(?<=[.!?])\s", text.strip())[0]
+    if level == 2:
+        return "Calm, gentle, family-friendly scene. " + first
+    words = first.split()[:14]
+    return "A peaceful, gentle, family-friendly scene: " + " ".join(words)
 
 
 def _attempt_generate(account_id, api_token, model_name, prompt_text, negative_prompt, out_path):
@@ -415,6 +458,8 @@ def _generate_with_fallback(account_id, api_token, model_state, prompt_text, neg
                     # Account-wide daily budget is gone — retrying or
                     # switching models won't help until the next UTC reset.
                     raise RuntimeError(f"Daily Neuron quota exhausted: {err_text}")
+                elif kind == "content_filtered":
+                    raise ContentFilterError(err_text)
                 elif kind == "model_unavailable":
                     break
                 elif kind == "rate_limit":
@@ -442,8 +487,32 @@ def _generate_with_fallback(account_id, api_token, model_state, prompt_text, neg
 # Main entry point
 # --------------------------------------------------------------------------
 
-def run_image_generation(manifest_path, api_key, progress_callback=None, style=DEFAULT_STYLE,
-                          on_image_saved=None, account_id=None):
+class _AccountPool:
+    """Ordered list of Cloudflare accounts, used strictly in sequence.
+    Account 1 is used until its daily quota is gone, then account 2, and so on."""
+
+    def __init__(self, accounts):
+        self.accounts = list(accounts)          # [(label, account_id, token), ...]
+        self.index = 0
+        self.status = {a[0]: "ok" for a in self.accounts}
+
+    def current(self):
+        return self.accounts[self.index] if self.index < len(self.accounts) else None
+
+    def retire(self, reason):
+        """Mark the current account as unusable and move to the next one."""
+        label = self.accounts[self.index][0]
+        self.status[label] = reason
+        self.index += 1
+        return self.current()
+
+    @property
+    def exhausted(self):
+        return self.index >= len(self.accounts)
+
+
+def run_image_generation(manifest_path, api_key=None, progress_callback=None, style=DEFAULT_STYLE,
+                          on_image_saved=None, account_id=None, accounts=None):
     """
     Generates one image per manifest row via Cloudflare Workers AI.
 
@@ -456,10 +525,15 @@ def run_image_generation(manifest_path, api_key, progress_callback=None, style=D
 
     Returns (images_dir, zip_path, failed_scene_ids).
     """
-    if not api_key:
-        raise ValueError("Missing Cloudflare API token.")
-    if not account_id:
-        raise ValueError("Missing Cloudflare account ID.")
+    if not accounts:
+        if not api_key:
+            raise ValueError("Missing Cloudflare API token.")
+        if not account_id:
+            raise ValueError("Missing Cloudflare account ID.")
+        accounts = [("Account 1", account_id, api_key)]
+    pool = _AccountPool(accounts)
+    last_error = {}
+    softened = {}
 
     style_config = STYLE_PRESETS.get(style, STYLE_PRESETS[DEFAULT_STYLE])
     style_prefix = style_config["prompt"] + ANATOMY_POSITIVE
@@ -498,34 +572,72 @@ def run_image_generation(manifest_path, api_key, progress_callback=None, style=D
 
     def _run_one(scene_id, prompt, out_path):
         nonlocal done_images, last_model_reported, quota_exhausted
-        full_prompt = style_prefix + prompt
         rate_limiter.wait()
-        try:
-            _generate_with_fallback(account_id, api_key, model_state, full_prompt, negative_prompt,
-                                     out_path, rate_limiter)
-            done_images += 1
-            if on_image_saved:
-                try:
-                    on_image_saved(scene_id, out_path)
-                except Exception:
-                    pass
-            if progress_callback:
-                progress_callback(done_images, total_images,
-                                   f"Scene {scene_id} done (~{rate_limiter.current_rpm} req/min).")
-            if model_state.current() != last_model_reported:
-                last_model_reported = model_state.current()
+        level = 0
+        while True:
+            full_prompt = style_prefix + (_soften_prompt(prompt, level) if level else prompt)
+            acct = pool.current()
+            if acct is None:
+                quota_exhausted = True
+                return False
+            label, acct_id, acct_token = acct
+            try:
+                _generate_with_fallback(acct_id, acct_token, model_state, full_prompt, negative_prompt,
+                                         out_path, rate_limiter)
+                done_images += 1
+                if on_image_saved:
+                    try:
+                        on_image_saved(scene_id, out_path)
+                    except Exception:
+                        pass
+                if level:
+                    softened[scene_id] = level
                 if progress_callback:
                     progress_callback(done_images, total_images,
-                                       f"Switched to fallback image model: {last_model_reported}")
-            return True
-        except AuthenticationError:
-            raise
-        except Exception as e:
-            if "daily neuron quota exhausted" in str(e).lower():
-                quota_exhausted = True
-            if progress_callback:
-                progress_callback(done_images, total_images, f"Scene {scene_id} failed, parked for retry: {e}")
-            return False
+                                       f"Scene {scene_id} done via {label}"
+                                       + (f" (prompt reworded, level {level})" if level else "")
+                                       + f" (~{rate_limiter.current_rpm} req/min).")
+                if model_state.current() != last_model_reported:
+                    last_model_reported = model_state.current()
+                    if progress_callback:
+                        progress_callback(done_images, total_images,
+                                           f"Switched to fallback image model: {last_model_reported}")
+                return True
+            except AuthenticationError as e:
+                nxt = pool.retire("credentials rejected")
+                if progress_callback:
+                    progress_callback(done_images, total_images,
+                                       f"{label}: credentials rejected ({str(e)[:120]}). "
+                                       + (f"Switching to {nxt[0]}." if nxt else "No more accounts."))
+                if nxt is None:
+                    raise
+                continue  # retry THIS scene on the next account
+            except ContentFilterError as e:
+                level += 1
+                if level > 3:
+                    last_error[scene_id] = "blocked by Cloudflare's content filter even after 3 rewordings: " + str(e)[:200]
+                    if progress_callback:
+                        progress_callback(done_images, total_images,
+                                           f"Scene {scene_id} still blocked after rewording, parked for retry.")
+                    return False
+                if progress_callback:
+                    progress_callback(done_images, total_images,
+                                       f"Scene {scene_id} blocked by content filter — retrying with a gentler "
+                                       f"prompt (level {level}/3).")
+                continue
+            except Exception as e:
+                if "daily neuron quota exhausted" in str(e).lower():
+                    nxt = pool.retire("daily quota used up")
+                    if progress_callback:
+                        progress_callback(done_images, total_images,
+                                           f"{label}: daily quota used up. "
+                                           + (f"Switching to {nxt[0]} and retrying scene {scene_id}."
+                                              if nxt else "All accounts are out of quota."))
+                    continue  # same scene, next account
+                last_error[scene_id] = str(e)[:300]
+                if progress_callback:
+                    progress_callback(done_images, total_images, f"Scene {scene_id} failed, parked for retry: {e}")
+                return False
 
     failed = []
     for scene_id, prompt, out_path in pending:
@@ -540,8 +652,8 @@ def run_image_generation(manifest_path, api_key, progress_callback=None, style=D
 
     if quota_exhausted and progress_callback:
         progress_callback(done_images, total_images,
-                           "Daily Cloudflare Neuron quota exhausted — remaining scenes parked. "
-                           "Resets at 00:00 UTC; come back and click Resume/Generate to continue.")
+                           f"All {len(pool.accounts)} Cloudflare account(s) are out of daily quota — remaining scenes "
+                           "parked. Quotas reset at 00:00 UTC (05:00 Pakistan); come back and click Resume.")
 
     round_num = 1
     while failed and round_num <= RETRY_ROUNDS and not quota_exhausted:
@@ -549,6 +661,7 @@ def run_image_generation(manifest_path, api_key, progress_callback=None, style=D
             progress_callback(done_images, total_images,
                                f"Retry round {round_num}/{RETRY_ROUNDS} — {len(failed)} scene(s) remaining.")
         still_failed = []
+        time.sleep(min(10 * round_num, 40))  # let transient problems clear before retrying
         for scene_id, prompt, out_path in failed:
             if quota_exhausted:
                 still_failed.append((scene_id, prompt, out_path))
@@ -559,6 +672,21 @@ def run_image_generation(manifest_path, api_key, progress_callback=None, style=D
         round_num += 1
 
     failed_scene_ids = [f[0] for f in failed]
+    if softened:
+        try:
+            with open(os.path.join(os.path.dirname(images_dir), "reworded_scenes.json"), "w") as f:
+                json.dump(softened, f)
+        except Exception:
+            pass
+        if progress_callback:
+            progress_callback(done_images, total_images,
+                               f"{len(softened)} scene(s) needed a reworded prompt to pass the filter: "
+                               f"{sorted(softened)} — worth a quick look in the gallery.")
+    if failed_scene_ids and not quota_exhausted and progress_callback:
+        for sid in failed_scene_ids[:10]:
+            progress_callback(done_images, total_images,
+                               f"Scene {sid} could not be generated after {RETRY_ROUNDS} retry rounds. "
+                               f"Reason: {last_error.get(sid, 'unknown')}")
 
     run_dir = os.path.dirname(images_dir)
     if failed_scene_ids:
