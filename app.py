@@ -1253,6 +1253,55 @@ with tab_video:
     else:
         st.caption("Captions appear here once the script and alignment manifest are loaded.")
 
+    # ---- YouTube chapters ----
+    st.markdown("#### Chapters (timestamps for the description)")
+    st.caption("Chapters show as sections on YouTube's progress bar. Press the button for a proposal built from your "
+               "real scene timings at the story's turning points, edit the titles (or times) freely, then paste "
+               "the list at the top of your video description. Keep titles teasers so they don't spoil twists.")
+    if _script_for_srt and _manifest_for_srt and os.path.exists(_manifest_for_srt):
+        if st.button("Suggest chapters", key="chapters_suggest"):
+            try:
+                import chapters as _ch
+                import thumbnail_studio as _ts
+                _df = pd.read_csv(_manifest_for_srt, encoding="utf-8-sig")
+                _df.columns = _df.columns.astype(str).str.strip().str.lower()
+                _starts, _total = _ch.scene_timings(_df)
+                _narr = {sc["scene_id"]: sc["narration"] for sc in parse_script_scenes(_script_for_srt)}
+                _props = _ch.propose_chapters(_starts, _total, _narr)
+                _titles = [p[2] for p in _props]
+                _note = ""
+                _gkey = get_secret(["GEMINI_API_KEY"])
+                if _gkey and _props:
+                    _ai, _err = _ch.ai_titles(_ch.section_excerpts(_props, _starts, _narr),
+                                              st.session_state.get("thumb_title", ""), _gkey,
+                                              _ts._gemini_json, get_secret(["GEMINI_MODEL"]))
+                    if _ai:
+                        _titles = _ai
+                    else:
+                        _note = f"Used simple default titles ({_err})."
+                _long = _total >= 3600
+                st.session_state["chapters_text"] = "\n".join(
+                    f"{_ch.format_timestamp(p[0], _long)} {_titles[i]}" for i, p in enumerate(_props))
+                st.session_state["chapters_total"] = _total
+                st.session_state["chapters_note"] = _note
+            except Exception as e:
+                st.warning(f"Could not build chapters: {e}")
+        if st.session_state.get("chapters_note"):
+            st.caption(st.session_state["chapters_note"])
+        if st.session_state.get("chapters_text"):
+            import chapters as _ch
+            edited = st.text_area("Chapters (edit freely, one per line: time then title)",
+                                  key="chapters_text", height=180)
+            _items, _bad = _ch.parse_chapter_text(edited)
+            for _b in _bad:
+                st.warning(f"Couldn't read this line (use m:ss then a title): {_b}")
+            for _p in _ch.validate(_items, st.session_state.get("chapters_total")):
+                st.warning(_p)
+            st.caption("Copy-ready:")
+            st.code(edited, language=None)
+    else:
+        st.caption("Chapters appear here once the script and alignment manifest are loaded.")
+
 
 with tab_thumb:
     import thumbnail_maker
