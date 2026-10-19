@@ -20,7 +20,7 @@ import requests
 from PIL import Image, ImageEnhance, ImageFilter, ImageStat
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+GEMINI_FALLBACK = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]   # last resort only; names get retired
 MAX_TEXT_WORDS = 4
 
 # --------------------------------------------------------------------------
@@ -91,12 +91,59 @@ def rank_scene_images(scene_files, top_n=6, min_gap=None):
 # 2. Gemini helper
 # --------------------------------------------------------------------------
 
+_MODEL_CACHE = {}
+
+
+def discover_models(api_key):
+    """Ask Google which Gemini 'flash' models can be used right now (newest stable first).
+    Model names get retired, so a fixed list goes stale. Returns [] on any failure."""
+    if "list" in _MODEL_CACHE:
+        return _MODEL_CACHE["list"]
+    found = []
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         params={"pageSize": 200}, headers={"x-goog-api-key": api_key}, timeout=20)
+        if r.status_code == 200:
+            skip = ("image", "tts", "audio", "live", "embed", "robot", "computer", "vision", "learnlm", "gemma")
+            rows = []
+            for m in r.json().get("models", []):
+                name = str(m.get("name", "")).replace("models/", "")
+                if not name.startswith("gemini") or "flash" not in name:
+                    continue
+                if any(t in name for t in skip):
+                    continue
+                if "generateContent" not in (m.get("supportedGenerationMethods") or []):
+                    continue
+                ver = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+                version = float(ver.group(1)) if ver else 0.0
+                unstable = any(t in name for t in ("preview", "exp", "-0"))
+                lite = "lite" in name
+                rows.append((-version, unstable, lite, name))
+            rows.sort()
+            found = [x[3] for x in rows]
+    except Exception:
+        found = []
+    if found:
+        _MODEL_CACHE["list"] = found
+    return found
+
+
+def candidate_models(api_key, override=""):
+    """Override first, then Google's self-updating alias, then whatever Google lists, then old names."""
+    out = []
+    for m in [override, "gemini-flash-latest"] + discover_models(api_key)[:5] + ["gemini-flash-lite-latest"] + GEMINI_FALLBACK:
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
 def _gemini_json(system_prompt, user_prompt, api_key, model_override=""):
     """Returns (parsed_json_or_None, error_message_or_None)."""
     if not api_key:
         return None, "No GEMINI_API_KEY in Secrets."
-    models = ([model_override] if model_override else []) + [m for m in GEMINI_MODELS if m != model_override]
+    models = candidate_models(api_key, model_override)
     last = "unknown error"
+    errors = []
     for model in models:
         body = {
             "systemInstruction": {"parts": [{"text": system_prompt}]},
@@ -127,7 +174,8 @@ def _gemini_json(system_prompt, user_prompt, api_key, model_override=""):
                 time.sleep(3)
                 continue
             break
-    return None, last
+        errors.append(last)
+    return None, "No Gemini model worked. " + " | ".join(e[:110] for e in errors[:3])
 
 # --------------------------------------------------------------------------
 # 3. Text ideas
