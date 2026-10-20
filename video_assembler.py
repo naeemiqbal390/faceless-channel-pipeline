@@ -12,9 +12,11 @@ Two design decisions worth knowing about:
    reused for that duration, and the scene is reported back so the real
    artwork can be swapped in once it exists.
 
-2. MOTION INSTEAD OF A DURATION CAP: every scene image gets a slow,
-   alternating zoom-in/zoom-out (Ken Burns effect) for its exact narrated
-   duration, rather than capping how long an image can stay on screen.
+2. MOTION INSTEAD OF A DURATION CAP: every scene image gets exactly ONE
+   slow, small movement (zoom in, zoom out, or a gentle pan left/right/up/
+   down, cycling in a fixed varied order) for its exact narrated duration,
+   and consecutive images are joined with a slow cross-dissolve, rather than
+   capping how long an image can stay on screen.
    A hard cap (e.g. 5s max) would force the picture to stop matching the
    narration for whatever's left of that scene — motion solves "boring"
    without ever breaking audio/video sync.
@@ -29,6 +31,7 @@ on Streamlit Community Cloud without it.
 
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import tempfile
 
 VIDEO_WIDTH = 1024
@@ -97,39 +100,90 @@ ZOOM_RATE_PER_SECOND = 0.015
 ZOOMPAN_UPSCALE = 4096
 
 
-def _render_scene_clip(image_path, duration, output_path, zoom_out):
-    """
-    Renders one scene's image into a short video clip with a slow,
-    continuous zoom (Ken Burns effect) — zooming in for even-indexed
-    scenes, out for odd-indexed ones, so consecutive scenes don't feel
-    repetitive. Kept centered so it never crops off anything important.
-    """
-    duration = max(0.5, duration)
-    frames = max(1, round(duration * FPS))
-    effective_max_zoom = min(MAX_ZOOM, 1.0 + ZOOM_RATE_PER_SECOND * duration)
-    step = (effective_max_zoom - 1.0) / frames
+# One movement per image, cycling so neighbours never repeat the same move.
+MOTION_CYCLE = ["zoom_in", "pan_right", "zoom_out", "pan_left",
+                "zoom_in", "pan_down", "zoom_out", "pan_up"]
 
-    if zoom_out:
-        zoom_expr = f"if(eq(on,1),{effective_max_zoom},max(zoom-{step:.6f},1.0))"
-    else:
-        zoom_expr = f"min(zoom+{step:.6f},{effective_max_zoom})"
+# Zoom level used while panning. 1.09 means the picture is 9% larger than the
+# frame, so a pan travels about 8% of the width: slow and small.
+PAN_ZOOM = 1.09
 
-    vf = (
+# Length of the cross-dissolve between two images (seconds). Capped for short
+# scenes so a dissolve never takes more than ~30% of either neighbour.
+TRANSITION_SECONDS = 0.8
+MIN_CLIP_FRAMES = 6
+
+
+def _motion_exprs(motion, offset_frames, total_frames, length_seconds):
+    """zoompan z/x/y expressions for ONE movement. Progress p runs 0 -> 1 over
+    the image's whole on-screen life (including the part shared with a
+    dissolve), so the movement stays continuous across the dissolve."""
+    total_frames = max(1, int(total_frames))
+    p = f"min(1,(on-1+{int(offset_frames)})/{total_frames})"
+    amount = min(MAX_ZOOM - 1.0, ZOOM_RATE_PER_SECOND * max(0.5, length_seconds))
+    cx = "iw/2-(iw/zoom/2)"
+    cy = "ih/2-(ih/zoom/2)"
+    if motion == "zoom_in":
+        return f"1+{amount:.5f}*{p}", cx, cy
+    if motion == "zoom_out":
+        return f"1+{amount:.5f}*(1-{p})", cx, cy
+    z = f"{PAN_ZOOM}"
+    if motion == "pan_right":
+        return z, f"(iw-iw/zoom)*{p}", cy
+    if motion == "pan_left":
+        return z, f"(iw-iw/zoom)*(1-{p})", cy
+    if motion == "pan_down":
+        return z, cx, f"(ih-ih/zoom)*{p}"
+    if motion == "pan_up":
+        return z, cx, f"(ih-ih/zoom)*(1-{p})"
+    return "1", cx, cy
+
+
+def _zoompan_chain(frames, motion, offset_frames, total_frames):
+    z, x, y = _motion_exprs(motion, offset_frames, total_frames, total_frames / FPS)
+    return (
         f"scale={ZOOMPAN_UPSCALE}:{ZOOMPAN_UPSCALE}:flags=lanczos,"
-        f"zoompan=z='{zoom_expr}':d={frames}"
-        f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-        f":s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={FPS}"
+        f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}"
+        f":s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={FPS},setsar=1,format=yuv420p"
     )
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-loop", "1", "-i", image_path,
-        "-vf", vf,
-        "-t", f"{duration:.3f}",
-        "-pix_fmt", "yuv420p",
-        "-c:v", "libx264", "-preset", "faster", "-crf", "18",
-        output_path,
-    ]
+
+def _render_scene_clip(image_path, frames, motion, in_frames, total_frames, output_path,
+                       next_image_path=None, tail_frames=0, next_motion=None, next_total_frames=0):
+    """
+    Renders one scene's clip of exactly `frames` frames.
+
+    The clip shows its own image with one movement. During its last
+    `tail_frames` frames it dissolves into the NEXT image, whose own movement
+    has already begun (so it keeps moving smoothly after the cut point,
+    where the next clip takes over without any jump).
+
+    in_frames    - frames of this image already shown during the previous
+                   clip's dissolve (movement progress starts there)
+    total_frames - this image's whole on-screen life in frames
+    """
+    cur = _zoompan_chain(frames, motion, in_frames, total_frames)
+
+    if next_image_path and tail_frames > 0:
+        nxt = _zoompan_chain(tail_frames, next_motion, 0, next_total_frames)
+        t_s = tail_frames / FPS
+        off_s = (frames - tail_frames) / FPS
+        graph = (
+            f"[0:v]{cur}[a];[1:v]{nxt}[b];"
+            f"[a][b]xfade=transition=fade:duration={t_s:.4f}:offset={off_s:.4f},"
+            f"tpad=stop=3:stop_mode=clone[v]"
+        )
+        inputs = ["-i", image_path, "-i", next_image_path]
+    else:
+        graph = f"[0:v]{cur},tpad=stop=3:stop_mode=clone[v]"
+        inputs = ["-i", image_path]
+
+    cmd = (["ffmpeg", "-y"] + inputs +
+           ["-filter_complex", graph, "-map", "[v]",
+            "-frames:v", str(frames), "-r", str(FPS),
+            "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "faster", "-crf", "18",
+            output_path])
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg (scene clip render) failed:\n{result.stderr[-1500:]}")
@@ -224,8 +278,26 @@ def assemble_video(manifest_path, images_dir, audio_path, output_path, progress_
     # opening seconds blank.
     boundaries[0] = 0.0
 
+    # Frame-exact timeline: every clip length is a whole number of frames and
+    # the clip boundaries come from rounding the ABSOLUTE times, so rounding
+    # errors never accumulate (zero drift against the audio over any length).
+    fb = [int(round(t * FPS)) for t in boundaries]
+    for i in range(1, len(fb)):
+        if fb[i] < fb[i - 1] + MIN_CLIP_FRAMES:
+            fb[i] = fb[i - 1] + MIN_CLIP_FRAMES
+    frames_list = [fb[i + 1] - fb[i] for i in range(len(scene_entries))]
     for i, entry in enumerate(scene_entries):
-        entry["duration"] = max(0.5, boundaries[i + 1] - boundaries[i])
+        entry["duration"] = frames_list[i] / FPS
+
+    # Dissolve length at each boundary (frames); 0 = hard cut for tiny clips.
+    n_scenes = len(scene_entries)
+    base_tf = int(round(TRANSITION_SECONDS * FPS))
+    tf = []
+    for i in range(n_scenes - 1):
+        t = min(base_tf, int(0.3 * min(frames_list[i], frames_list[i + 1])))
+        tf.append(t if t >= 3 else 0)
+    t_in = [0] + tf                      # frames of image i shown inside the previous dissolve
+    life = [frames_list[i] + t_in[i] for i in range(n_scenes)]   # image i's whole on-screen life
 
     if progress_callback:
         total_span = boundaries[-1] - boundaries[0]
@@ -233,17 +305,44 @@ def assemble_video(manifest_path, images_dir, audio_path, output_path, progress_
         progress_callback(0, total, f"Scene timeline covers {total_span:.1f}s gaplessly{audio_note}.")
 
     work_dir = tempfile.mkdtemp(prefix="video_assembly_")
-    clip_paths = []
+    clip_paths = [os.path.join(work_dir, f"clip_{i:04d}.mp4") for i in range(n_scenes)]
 
-    for i, entry in enumerate(scene_entries):
-        clip_path = os.path.join(work_dir, f"clip_{i:04d}.mp4")
-        zoom_out = (i % 2 == 1)
-        _render_scene_clip(entry["image_path"], entry["duration"], clip_path, zoom_out)
-        clip_paths.append(clip_path)
+    def render_one(i):
+        entry = scene_entries[i]
+        motion = MOTION_CYCLE[i % len(MOTION_CYCLE)]
+        has_next = i < n_scenes - 1 and tf[i] > 0
+        _render_scene_clip(
+            entry["image_path"], frames_list[i], motion, t_in[i], life[i], clip_paths[i],
+            next_image_path=scene_entries[i + 1]["image_path"] if has_next else None,
+            tail_frames=tf[i] if has_next else 0,
+            next_motion=MOTION_CYCLE[(i + 1) % len(MOTION_CYCLE)] if has_next else None,
+            next_total_frames=life[i + 1] if has_next else 0,
+        )
+        return i
 
-        if progress_callback:
-            note = " (filled from adjacent scene — swap in later)" if entry.get("filled_from_adjacent") else ""
-            progress_callback(i + 1, total, f"Scene {entry['scene_id']} rendered ({entry['duration']:.1f}s){note}.")
+    # Each clip is an independent ffmpeg run, and the zoom/pan filter uses only one CPU core, so two
+    # clips at a time is about 1.4x faster on a 2-core host. Peak memory is roughly 300 MB per worker.
+    # Set VIDEO_WORKERS=1 (environment/secret) if the host runs out of memory.
+    try:
+        workers = max(1, min(4, int(os.environ.get("VIDEO_WORKERS", "2"))))
+    except ValueError:
+        workers = 2
+    done_count = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(render_one, i) for i in range(n_scenes)]
+        try:
+            for fut in as_completed(futures):
+                i = fut.result()                 # re-raises the first ffmpeg failure
+                done_count += 1
+                if progress_callback:
+                    entry = scene_entries[i]
+                    motion = MOTION_CYCLE[i % len(MOTION_CYCLE)]
+                    note = " (filled from adjacent scene — swap in later)" if entry.get("filled_from_adjacent") else ""
+                    progress_callback(done_count, total, f"Scene {entry['scene_id']} rendered ({entry['duration']:.1f}s, {motion.replace('_', ' ')}){note}.")
+        except Exception:
+            for f in futures:
+                f.cancel()
+            raise
 
     concat_list_path = os.path.join(work_dir, "concat_list.txt")
     with open(concat_list_path, "w") as f:
