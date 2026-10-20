@@ -74,8 +74,8 @@ RETRY_ROUNDS = 5
 # — the real constraint is the daily Neuron budget, not request pace, so
 # pacing here just avoids hammering the API pointlessly, not rationing.
 FLOOR_RPM = 20
-CEILING_RPM = 60
-START_RPM = 40
+CEILING_RPM = 240
+START_RPM = 90
 
 IMAGE_WIDTH = 1024
 IMAGE_HEIGHT = 1024
@@ -495,14 +495,16 @@ class _AccountPool:
         self.accounts = list(accounts)          # [(label, account_id, token), ...]
         self.index = 0
         self.status = {a[0]: "ok" for a in self.accounts}
+        self.detail = {}
 
     def current(self):
         return self.accounts[self.index] if self.index < len(self.accounts) else None
 
-    def retire(self, reason):
+    def retire(self, reason, detail=""):
         """Mark the current account as unusable and move to the next one."""
         label = self.accounts[self.index][0]
         self.status[label] = reason
+        self.detail[label] = detail[:260]
         self.index += 1
         return self.current()
 
@@ -604,7 +606,7 @@ def run_image_generation(manifest_path, api_key=None, progress_callback=None, st
                                            f"Switched to fallback image model: {last_model_reported}")
                 return True
             except AuthenticationError as e:
-                nxt = pool.retire("credentials rejected")
+                nxt = pool.retire("credentials rejected", str(e))
                 if progress_callback:
                     progress_callback(done_images, total_images,
                                        f"{label}: credentials rejected ({str(e)[:120]}). "
@@ -627,7 +629,7 @@ def run_image_generation(manifest_path, api_key=None, progress_callback=None, st
                 continue
             except Exception as e:
                 if "daily neuron quota exhausted" in str(e).lower():
-                    nxt = pool.retire("daily quota used up")
+                    nxt = pool.retire("daily quota used up", str(e))
                     if progress_callback:
                         progress_callback(done_images, total_images,
                                            f"{label}: daily quota used up. "
@@ -672,6 +674,12 @@ def run_image_generation(manifest_path, api_key=None, progress_callback=None, st
         round_num += 1
 
     failed_scene_ids = [f[0] for f in failed]
+    if progress_callback:
+        for label, state in pool.status.items():
+            msg = f"[{label}] {state}"
+            if pool.detail.get(label):
+                msg += f" — Cloudflare said: {pool.detail[label]}"
+            progress_callback(done_images, total_images, msg)
     if softened:
         try:
             with open(os.path.join(os.path.dirname(images_dir), "reworded_scenes.json"), "w") as f:
