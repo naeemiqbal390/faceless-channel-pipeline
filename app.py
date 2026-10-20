@@ -43,7 +43,7 @@ def compute_project_id(script_text):
     return hashlib.sha256(script_text.encode("utf-8")).hexdigest()[:16]
 
 
-def get_project_status(project_id):
+def _get_project_status_uncached(project_id):
     """
     Returns what's saved in B2 for this project, or None if B2 isn't
     configured or nothing's saved yet. This is what /tmp being wiped on
@@ -64,6 +64,13 @@ def get_project_status(project_id):
         "num_images": len(image_keys),
         "has_video": any(k.endswith("final_video.mp4") for k in keys),
     }
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def get_project_status(project_id):
+    """Cached for 45 s: this B2 listing used to run on EVERY click, because Streamlit re-runs the whole
+    page (all tabs) each time. Cleared whenever progress changes (Resume, Clear, image generation)."""
+    return _get_project_status_uncached(project_id)
 
 
 def resume_project_from_b2(project_id):
@@ -171,6 +178,38 @@ def invalidate_saved_video(manifest_path=None):
             b2_storage.delete_prefix(f"projects/{compute_project_id(script_text)}/final_video.mp4")
     except Exception:
         pass
+
+
+def make_background_uploader(workers=3):
+    """Uploads each finished image to B2 in background threads, so image generation is no longer
+    paused while every picture uploads. Returns (submit, finish); call finish() when generation ends.
+    Anything that fails here is caught later by sync_images_to_b2()."""
+    from concurrent.futures import ThreadPoolExecutor
+    import b2_storage
+    script_text = st.session_state.get("script_text", "")
+    enabled = bool(script_text) and b2_storage.is_configured()
+    pid = compute_project_id(script_text) if enabled else None
+    pool = ThreadPoolExecutor(max_workers=workers) if enabled else None
+
+    def submit(local_path, relative_name):
+        if not enabled:
+            return
+
+        def job():
+            for _ in range(3):
+                try:
+                    if b2_storage.upload_file(local_path, f"projects/{pid}/{relative_name}"):
+                        return
+                except Exception:
+                    pass
+                time.sleep(1)
+        pool.submit(job)
+
+    def finish():
+        if pool:
+            pool.shutdown(wait=True)
+
+    return submit, finish
 
 
 def upload_to_project(local_path, relative_name):
@@ -320,6 +359,12 @@ def build_srt(script_text, manifest_path):
             n += 1
             t += dur
     return "\n".join(out)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def build_srt_cached(script_text, manifest_path, manifest_mtime):
+    """build_srt re-reads the manifest and re-parses the script; cache it so clicks elsewhere don't repeat that."""
+    return build_srt(script_text, manifest_path)
 
 
 def force_fix_manifest_csv(csv_path):
@@ -615,6 +660,21 @@ def make_progress_log(container, max_lines_shown=40):
     return _log
 
 
+def show_video_preview(video_path, key):
+    """The video file can be hundreds of MB, and Streamlit re-reads whatever is shown on EVERY click
+    (this page showed it in two tabs). So the player and download button load only when asked."""
+    try:
+        size_mb = os.path.getsize(video_path) / (1024 * 1024)
+    except OSError:
+        return
+    if st.checkbox(f"Show video player and download ({size_mb:.0f} MB; leave off to keep the app fast)",
+                   key=f"show_video_{key}", value=False):
+        st.video(video_path)
+        with open(video_path, "rb") as f:
+            st.download_button("Download final_video.mp4", f, file_name="final_video.mp4",
+                               mime="video/mp4", key=f"dl_video_{key}")
+
+
 def make_image_gallery(container, images_dir, cols=5, max_shown=15):
     """
     Renders the most recently generated images as a thumbnail grid,
@@ -745,9 +805,11 @@ with tab0:
                 if resume_col.button("Resume — load saved progress", type="primary"):
                     with st.spinner("Downloading saved progress from B2..."):
                         st.session_state["resume_summary"] = resume_project_from_b2(check_project_id)
+                    get_project_status.clear()
                     st.rerun()
                 if clear_col.button("Clear saved progress — back to stage 1"):
                     b2_storage.delete_prefix(f"projects/{check_project_id}/")
+                    get_project_status.clear()
                     try:
                         b2_storage.delete_prefix("projects/_latest.json")
                     except Exception:
@@ -796,14 +858,14 @@ with tab0:
         if images_d and os.path.isdir(images_d):
             all_pngs = sorted(f for f in os.listdir(images_d) if f.lower().endswith(".png"))
             with st.expander(f"{len(all_pngs)} image(s) available — click to review", expanded=False):
-                status_gallery_placeholder = st.empty()
-                make_image_gallery(status_gallery_placeholder, images_d, max_shown=40)()
+                # Building this grid sends ~0.5 MB of HTML to the browser on every click, even while the
+                # expander is closed, so it only loads when ticked.
+                if st.checkbox("Load thumbnails", key="show_status_gallery", value=False):
+                    status_gallery_placeholder = st.empty()
+                    make_image_gallery(status_gallery_placeholder, images_d, max_shown=40)()
         video_p = st.session_state.get("video_path")
         if video_p and os.path.exists(video_p):
-            st.video(video_p)
-            with open(video_p, "rb") as f:
-                st.download_button("Download final_video.mp4", f, file_name="final_video.mp4",
-                                    mime="video/mp4", key="dl_video_tab0_status")
+            show_video_preview(video_p, "tab0_status")
 
     st.divider()
     st.checkbox("Show live image gallery while generating (turn off if the app gets throttled)",
@@ -906,8 +968,10 @@ with tab0:
                     image_log(f"{done_images}/{total_images} images generated — {message}")
                     refresh_gallery()
 
+                _bg_submit, _bg_finish = make_background_uploader()
+
                 def on_image_saved(scene_id, local_path):
-                    upload_to_project(local_path, f"scene_images/{os.path.basename(local_path)}")
+                    _bg_submit(local_path, f"scene_images/{os.path.basename(local_path)}")
 
                 invalidate_saved_video(active_manifest)
                 images_dir, zip_path, failed_scenes = cloudflare_runner.run_image_generation(
@@ -918,7 +982,9 @@ with tab0:
                 )
                 st.session_state["images_dir"] = images_dir
                 refresh_gallery(force=True)
+                _bg_finish()
                 sync_images_to_b2(images_dir)
+                get_project_status.clear()
                 _status = cloudflare_runner.get_resume_status(active_manifest)
                 _missing = _status["total_images"] - _status["done_images"]
                 if _missing > 0 or failed_scenes:
@@ -1124,8 +1190,10 @@ with tab_images:
                     image_log(f"{done_images}/{total_images} images generated — {message}")
                     refresh_gallery()
 
+                _bg_submit, _bg_finish = make_background_uploader()
+
                 def on_image_saved(scene_id, local_path):
-                    upload_to_project(local_path, f"scene_images/{os.path.basename(local_path)}")
+                    _bg_submit(local_path, f"scene_images/{os.path.basename(local_path)}")
 
                 invalidate_saved_video(active_manifest_path)
                 images_dir, zip_path, failed_scenes = cloudflare_runner.run_image_generation(
@@ -1137,7 +1205,9 @@ with tab_images:
                 st.session_state["images_dir"] = images_dir
 
                 refresh_gallery(force=True)
+                _bg_finish()
                 sync_images_to_b2(images_dir)
+                get_project_status.clear()
                 _status = cloudflare_runner.get_resume_status(active_manifest_path)
                 _missing = _status["total_images"] - _status["done_images"]
                 if _missing > 0 or failed_scenes:
@@ -1232,10 +1302,7 @@ with tab_video:
                 st.error(f"Video assembly failed: {e}")
 
     if st.session_state.get("video_path") and os.path.exists(st.session_state["video_path"]):
-        st.video(st.session_state["video_path"])
-        with open(st.session_state["video_path"], "rb") as f:
-            st.download_button("Download final_video.mp4", f, file_name="final_video.mp4", mime="video/mp4",
-                                key="dl_video_tab")
+        show_video_preview(st.session_state["video_path"], "video_tab")
 
     st.markdown("#### Captions (.srt)")
     st.caption("YouTube also makes automatic captions on its own after upload (usually within minutes to a few "
@@ -1245,7 +1312,7 @@ with tab_video:
     _manifest_for_srt = st.session_state.get("manifest_path")
     if _script_for_srt and _manifest_for_srt and os.path.exists(_manifest_for_srt):
         try:
-            srt_text = build_srt(_script_for_srt, _manifest_for_srt)
+            srt_text = build_srt_cached(_script_for_srt, _manifest_for_srt, os.path.getmtime(_manifest_for_srt))
             st.download_button("Download captions.srt", srt_text.encode("utf-8"), file_name="captions.srt",
                                mime="application/x-subrip", key="dl_srt_tab")
         except Exception as e:
