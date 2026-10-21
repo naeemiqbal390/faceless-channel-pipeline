@@ -12,6 +12,7 @@ import hashlib
 import tempfile
 import asyncio
 import time
+import shutil
 from difflib import SequenceMatcher
 
 import streamlit as st
@@ -66,9 +67,9 @@ def _get_project_status_uncached(project_id):
     }
 
 
-@st.cache_data(ttl=45, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def get_project_status(project_id):
-    """Cached for 45 s: this B2 listing used to run on EVERY click, because Streamlit re-runs the whole
+    """Cached for 15 min (Backblaze counts every listing against a daily free allowance): this B2 listing used to run on EVERY click, because Streamlit re-runs the whole
     page (all tabs) each time. Cleared whenever progress changes (Resume, Clear, image generation)."""
     return _get_project_status_uncached(project_id)
 
@@ -118,19 +119,11 @@ def resume_project_from_b2(project_id):
         summary["total"] = status["total_images"]
         summary["have"] = status["done_images"]
 
+    # The finished video is no longer kept in Backblaze (big downloads burn the free daily allowance and the
+    # video can be rebuilt from the saved pictures in minutes). An older copy left over is simply removed.
     video_key = prefix + "final_video.mp4"
     if b2_storage.key_exists(video_key):
-        complete = summary["total"] > 0 and summary["have"] >= summary["total"]
-        if complete:
-            local_video = os.path.join(session_dir, "final_video.mp4")
-            if b2_storage.download_file(video_key, local_video):
-                st.session_state["video_path"] = local_video
-                summary["video"] = True
-        else:
-            # stale video made before all images existed — remove it
-            b2_storage.delete_prefix(video_key)
-            st.session_state.pop("video_path", None)
-            summary["video_discarded"] = True
+        b2_storage.delete_prefix(video_key)
 
     st.session_state["project_id"] = project_id
     return summary
@@ -284,8 +277,8 @@ def autoload_last_project():
             return
         with open(script_local, "r", encoding="utf-8") as f:
             st.session_state["script_text"] = f.read()
-        with st.spinner("Restoring your last project from B2..."):
-            st.session_state["resume_summary"] = resume_project_from_b2(project_id)
+        # Only the script is restored automatically. Downloading every picture on each app wake-up used
+        # up Backblaze's free daily download allowance, so pictures/audio come back when you press Resume.
         st.session_state["autoloaded_project"] = project_id
     except Exception as e:
         print(f"[autoload] could not restore last project: {e}", flush=True)
@@ -765,8 +758,8 @@ autoload_last_project()
 if st.session_state.get("autoloaded_project"):
     st.success("Reopened your last project exactly where you left it. Use the tabs below to continue.")
 
-tab0, tab_audio, tab_align, tab_images, tab_video, tab_thumb = st.tabs(
-    ["1. Paste script", "2. Audio", "3. Align", "4. Images", "5. Video", "6. Thumbnail"]
+tab0, tab_audio, tab_align, tab_images, tab_review, tab_video, tab_thumb = st.tabs(
+    ["1. Paste script", "2. Audio", "3. Align", "4. Images", "5. Review", "6. Video", "7. Thumbnail"]
 )
 
 with tab0:
@@ -798,7 +791,7 @@ with tab0:
                     "audio ✓" if project_status["has_audio"] else "audio ✗",
                     "manifest ✓" if project_status["has_manifest"] else "manifest ✗",
                     f"{project_status['num_images']} images saved",
-                    "video saved (checked against images on Resume)" if project_status["has_video"] else "video ✗",
+                    "video: not stored (rebuilt from the pictures)",
                 ]
                 st.info(f"Saved progress found for this script: {', '.join(status_bits)}")
                 resume_col, clear_col = st.columns(2)
@@ -985,6 +978,7 @@ with tab0:
                 _bg_finish()
                 sync_images_to_b2(images_dir)
                 get_project_status.clear()
+                st.session_state["images_reviewed"] = False
                 _status = cloudflare_runner.get_resume_status(active_manifest)
                 _missing = _status["total_images"] - _status["done_images"]
                 if _missing > 0 or failed_scenes:
@@ -1005,37 +999,9 @@ with tab0:
                     st.download_button("Download scene_images_batch.zip", f, file_name="scene_images_batch.zip",
                                         mime="application/zip", key="dl_images_pipeline")
 
-                st.markdown("**Step 4/4 — video**")
-                video_bar = st.progress(0.0)
-                video_status = st.empty()
-                video_log = make_progress_log(video_status)
-
-                def on_video_progress(done_scenes, total_scenes, message):
-                    pct = done_scenes / total_scenes if total_scenes else 0
-                    video_bar.progress(min(pct, 1.0))
-                    video_log(f"{done_scenes}/{total_scenes} scenes — {message}")
-
-                import video_assembler
-                output_video_path = os.path.join(get_session_temp_dir(), "final_video.mp4")
-                final_path, filled_scenes = video_assembler.assemble_video(
-                    active_manifest, images_dir, audio_path, output_video_path,
-                    progress_callback=on_video_progress,
-                )
-                st.session_state["video_path"] = final_path
-                upload_to_project(final_path, "final_video.mp4")
-                video_bar.progress(1.0)
-                if filled_scenes:
-                    st.warning(f"Video assembled and fully in sync — but {len(filled_scenes)} scene(s) didn't "
-                               f"have their own image yet, so a neighboring scene's picture was used to fill "
-                               f"that gap: {filled_scenes}. Regenerate those in the Images tab, then reassemble "
-                               f"to swap in the real artwork.")
-                else:
-                    st.success("Video assembled.")
-
-                st.video(final_path)
-                with open(final_path, "rb") as f:
-                    st.download_button("Download final_video.mp4", f, file_name="final_video.mp4", mime="video/mp4",
-                                        key="dl_video_pipeline")
+                st.markdown("**Step 4/4 — check the pictures**")
+                st.success("All images are ready. Open the 5. Review tab, look through the pictures, fix any "
+                           "bad ones by scene number, then build the video in the 6. Video tab.")
 
             except Exception as e:
                 st.error(f"Pipeline stopped: {e}")
@@ -1208,6 +1174,7 @@ with tab_images:
                 _bg_finish()
                 sync_images_to_b2(images_dir)
                 get_project_status.clear()
+                st.session_state["images_reviewed"] = False
                 _status = cloudflare_runner.get_resume_status(active_manifest_path)
                 _missing = _status["total_images"] - _status["done_images"]
                 if _missing > 0 or failed_scenes:
@@ -1231,6 +1198,158 @@ with tab_images:
                         )
             except Exception as e:
                 st.error(f"Image generation failed: {e}")
+
+with tab_review:
+    import scene_fixer
+    import cloudflare_runner
+    st.markdown("### Review the pictures before building the video")
+    st.caption("Look through every picture first. Spot a bad one (an extra arm, a doubled face)? Type its scene "
+               "number below. It is redone and put back in the exact same place in the video. The first redo uses "
+               "the same prompt with a new random seed. If that one is still bad, the next redo uses a reworded prompt.")
+
+    _rv_manifest = st.session_state.get("manifest_path")
+    if not (_rv_manifest and os.path.exists(_rv_manifest)):
+        st.warning("No scene manifest loaded yet. Finish the Align step or press Resume on the first tab.")
+    else:
+        _rv_dir = cloudflare_runner.get_images_dir(_rv_manifest)
+        _rv_df = cloudflare_runner._load_manifest_df(_rv_manifest)
+        _rv_ids = sorted(int(x) for x in _rv_df["scene_id"])
+        _rv_prompts = {int(r["scene_id"]): (str(r["prompt"]) if r["prompt"] == r["prompt"] else "")
+                       for _, r in _rv_df.iterrows()}
+        _rv_have = [i for i in _rv_ids if os.path.exists(os.path.join(_rv_dir, f"scene_{i:03d}.png"))]
+        _rv_missing = [i for i in _rv_ids if i not in set(_rv_have)]
+        _rv_fixes = scene_fixer.load_fixes(_rv_dir)
+
+        if _rv_missing:
+            st.warning(f"{len(_rv_have)}/{len(_rv_ids)} pictures exist. Still missing: "
+                       f"{_rv_missing[:30]}{' ...' if len(_rv_missing) > 30 else ''}. "
+                       f"Finish them in the Images tab first.")
+        else:
+            st.success(f"All {len(_rv_ids)} pictures exist.")
+
+        # ---- gallery -----------------------------------------------------
+        _PER = 30
+        _pages = max(1, -(-len(_rv_have) // _PER))
+        gc1, gc2, gc3 = st.columns([1, 1, 2])
+        _page = gc1.number_input("Page", min_value=1, max_value=_pages, value=1, step=1, key="rv_page")
+        _show_prompts = gc2.checkbox("Show prompts", value=False, key="rv_prompts")
+        gc3.caption(f"Page {_page} of {_pages}: scenes "
+                    f"{(_rv_have[(_page - 1) * _PER] if _rv_have else 0)}-"
+                    f"{(_rv_have[min(_page * _PER, len(_rv_have)) - 1] if _rv_have else 0)}. "
+                    f"Pictures marked ✎ were redone before.")
+        _thumb_dir = os.path.join(os.path.dirname(_rv_dir), "thumbs")
+        _chunk = _rv_have[(_page - 1) * _PER: _page * _PER]
+        for _row_start in range(0, len(_chunk), 5):
+            _cols = st.columns(5)
+            for _c, _sid in zip(_cols, _chunk[_row_start:_row_start + 5]):
+                with _c:
+                    _tp = scene_fixer.make_thumb(os.path.join(_rv_dir, f"scene_{_sid:03d}.png"), _thumb_dir)
+                    st.image(_tp, caption=f"Scene {_sid}" + (" ✎" if str(_sid) in _rv_fixes else ""),
+                             use_container_width=True)
+                    if _show_prompts:
+                        st.caption(_rv_prompts.get(_sid, "")[:140])
+
+        # ---- close look ----------------------------------------------------
+        _look = st.number_input("Look closely at scene (0 = none)", min_value=0,
+                                max_value=max(_rv_ids) if _rv_ids else 0, value=0, step=1, key="rv_look")
+        if _look and _look in _rv_ids:
+            _lp = os.path.join(_rv_dir, f"scene_{_look:03d}.png")
+            if os.path.exists(_lp):
+                st.image(_lp, caption=f"Scene {_look}", width=640)
+                st.caption("Prompt in your manifest: " + _rv_prompts.get(_look, ""))
+                if str(_look) in _rv_fixes:
+                    _fx = _rv_fixes[str(_look)]
+                    st.caption(f"Redone {_fx.get('attempts', 0)} time(s). Last prompt used ({_fx.get('how', '')}): "
+                               f"{_fx.get('prompt', '')}")
+
+        st.divider()
+        # ---- redo box --------------------------------------------------------
+        if "_fix_box_next" in st.session_state:
+            st.session_state["fix_scenes"] = st.session_state.pop("_fix_box_next")
+        st.markdown("#### Redo some pictures")
+        _fix_text = st.text_input("Scene numbers to redo (for example: 12, 57, 100-103)", key="fix_scenes")
+        _fix_mode = st.radio(
+            "How to redo",
+            ["Smart: first redo = same prompt, later redos = reworded prompt",
+             "Always use a reworded prompt"],
+            key="fix_mode", horizontal=False)
+        _fix_ids, _fix_problems = scene_fixer.parse_scene_numbers(_fix_text, _rv_ids)
+        for _pb in _fix_problems:
+            st.warning(_pb)
+        if _fix_ids:
+            _again = [i for i in _fix_ids if str(i) in _rv_fixes]
+            st.caption(f"Will redo {len(_fix_ids)} scene(s): {_fix_ids}."
+                       + (f" Already redone before (will get a reworded prompt): {_again}." if _again else ""))
+
+        if st.button("Redo these pictures", type="primary", disabled=not _fix_ids, key="fix_go"):
+            _accts = get_cloudflare_accounts(st.session_state.get("tab_images_account", ""),
+                                             st.session_state.get("tab_images_key", ""))
+            if not _accts:
+                st.error("Cloudflare credentials missing. Add them to Secrets (or the Images tab fields).")
+            else:
+                import thumbnail_studio as _tsx
+                _bar = st.progress(0.0)
+                _box = st.empty()
+                _say = make_progress_log(_box, max_lines_shown=12)
+                _done_counter = {"n": 0}
+
+                def _fix_progress(msg):
+                    if "saved" in msg or "could not" in msg:
+                        _done_counter["n"] += 1
+                        _bar.progress(min(_done_counter["n"] / max(len(_fix_ids), 1), 1.0))
+                    _say(msg)
+
+                def _fix_saved(sid, path):
+                    try:
+                        import b2_storage
+                        if b2_storage.is_configured() and st.session_state.get("script_text"):
+                            for _ in range(3):
+                                if b2_storage.upload_file(
+                                        path, f"projects/{compute_project_id(st.session_state['script_text'])}"
+                                              f"/scene_images/{os.path.basename(path)}"):
+                                    break
+                    except Exception:
+                        pass
+
+                _res = scene_fixer.regenerate_scenes(
+                    _rv_manifest, _fix_ids, st.session_state.get("image_style", cloudflare_runner.DEFAULT_STYLE),
+                    _accts,
+                    mode=("reword" if _fix_mode.startswith("Always") else "auto"),
+                    gemini_key=get_secret(["GEMINI_API_KEY"]), gemini_model=get_secret(["GEMINI_MODEL"]),
+                    gemini_fn=_tsx._gemini_json, progress=_fix_progress, on_saved=_fix_saved)
+                st.session_state["fix_results"] = _res
+                st.session_state["images_reviewed"] = False
+                st.session_state.pop("video_path", None)
+                get_project_status.clear()
+                _failed = [k for k, v in _res.items() if not v["ok"]]
+                st.session_state["_fix_box_next"] = ", ".join(str(k) for k in _failed)
+                st.rerun()
+
+        _fr = st.session_state.get("fix_results")
+        if _fr:
+            _okd = [k for k, v in _fr.items() if v["ok"]]
+            _bad = [k for k, v in _fr.items() if not v["ok"]]
+            if _okd:
+                st.success(f"Redone and put back in place: {_okd}. Check them below; if one is still wrong, "
+                           f"type its number again and it will get a reworded prompt.")
+                _rc = st.columns(min(5, len(_okd)))
+                for _i, _sid in enumerate(_okd[:15]):
+                    with _rc[_i % len(_rc)]:
+                        st.image(os.path.join(_rv_dir, f"scene_{_sid:03d}.png"),
+                                 caption=f"Scene {_sid} ({_fr[_sid]['how']})", use_container_width=True)
+            if _bad:
+                st.error("Could not redo: " + "; ".join(f"{k} ({_fr[k]['error']})" for k in _bad)
+                         + ". The old pictures were kept. Their numbers are back in the box to try again.")
+            if st.button("Hide this result", key="fix_hide"):
+                st.session_state.pop("fix_results", None)
+                st.rerun()
+
+        st.divider()
+        if st.button("✅ Pictures look good: go to the video", key="rv_ok", disabled=bool(_rv_missing)):
+            st.session_state["images_reviewed"] = True
+        if st.session_state.get("images_reviewed"):
+            st.success("Marked as reviewed. Open the 6. Video tab and press Assemble Video.")
+
 
 with tab_video:
     st.markdown("### Assemble Final Video")
@@ -1260,8 +1379,16 @@ with tab_video:
     if not active_audio_for_video:
         st.warning("No narration audio found. Generate audio first, or upload it above.")
 
+    _reviewed = st.session_state.get("images_reviewed", False)
+    if not _reviewed:
+        st.info("Check the pictures in the 5. Review tab first (extra arms, doubled faces), then come back. "
+                "Already checked them, or want to skip it?")
+        _reviewed = st.checkbox("Skip review and build anyway", key="video_skip_review")
+
     if st.button("Assemble Video", type="primary"):
-        if not active_manifest_for_video or not images_dir_for_video:
+        if not _reviewed:
+            st.error("Review the pictures first (5. Review tab), or tick 'Skip review and build anyway'.")
+        elif not active_manifest_for_video or not images_dir_for_video:
             st.error("Missing scene manifest.")
         elif not active_audio_for_video or not os.path.exists(active_audio_for_video):
             st.error("Missing narration audio.")
@@ -1287,7 +1414,6 @@ with tab_video:
                     output_video_path, progress_callback=on_video_progress,
                 )
                 st.session_state["video_path"] = final_path
-                upload_to_project(final_path, "final_video.mp4")
                 video_bar.progress(1.0)
 
                 if filled_scenes:
@@ -1303,6 +1429,52 @@ with tab_video:
 
     if st.session_state.get("video_path") and os.path.exists(st.session_state["video_path"]):
         show_video_preview(st.session_state["video_path"], "video_tab")
+
+    # ---- finished: clear Backblaze --------------------------------------------------
+    st.markdown("#### Finished with this video?")
+    st.caption("Backblaze is only a safety copy for when the power or internet cuts out mid-run. Once you have "
+               "downloaded the video and no longer need the pictures, this removes this video's saved data "
+               "(script, audio, manifest, pictures, thumbnails) from Backblaze and clears the app, ready for the next one.")
+    if st.session_state.get("cleanup_msg"):
+        st.success(st.session_state.pop("cleanup_msg"))
+    _sc = st.session_state.get("script_text", "")
+    if _sc:
+        _ok_dl = st.checkbox("I have downloaded the video and it is safe on my computer", key="confirm_cleanup")
+        if st.button("Delete saved data from Backblaze and start the next video", disabled=not _ok_dl,
+                     key="cleanup_go"):
+            _pid = compute_project_id(_sc)
+            _deleted = None
+            try:
+                import b2_storage
+                if b2_storage.is_configured():
+                    _deleted = b2_storage.delete_prefix(f"projects/{_pid}/")
+                    b2_storage.delete_prefix("projects/_latest.json")
+            except Exception:
+                _deleted = False
+            try:
+                _idir = st.session_state.get("images_dir")
+                if _idir and os.path.isdir(_idir):
+                    shutil.rmtree(os.path.dirname(_idir), ignore_errors=True)
+                _vp = st.session_state.get("video_path")
+                if _vp and os.path.exists(_vp):
+                    os.remove(_vp)
+            except Exception:
+                pass
+            get_project_status.clear()
+            for _k in ["script_text", "audio_path", "manifest_path", "images_dir", "video_path", "project_id",
+                       "resume_summary", "images_reviewed", "fix_results", "chapters_text", "chapters_total",
+                       "chapters_note", "confirm_cleanup", "video_skip_review", "fix_scenes"]:
+                st.session_state.pop(_k, None)
+            st.session_state["autoload_done"] = True
+            st.session_state["cleanup_msg"] = (
+                "Backblaze copy deleted and the app is cleared. Paste the next script on the first tab."
+                if _deleted else
+                ("Cleared the app. Backblaze is not configured, so there was nothing to delete there."
+                 if _deleted is None else
+                 "Cleared the app, but Backblaze deletion reported a problem. Use 'Clear saved progress' on the first tab to retry."))
+            st.rerun()
+    else:
+        st.caption("Nothing loaded.")
 
     st.markdown("#### Captions (.srt)")
     st.caption("YouTube also makes automatic captions on its own after upload (usually within minutes to a few "
