@@ -108,10 +108,14 @@ def delete_prefix(prefix):
             return True
         for i in range(0, len(keys), 1000):  # S3-style batch delete caps at 1000/call
             batch = keys[i:i + 1000]
-            client.delete_objects(
-                Bucket=_bucket(),
-                Delete={"Objects": [{"Key": k} for k in batch]},
-            )
+            try:
+                client.delete_objects(
+                    Bucket=_bucket(),
+                    Delete={"Objects": [{"Key": k} for k in batch]},
+                )
+            except Exception:
+                for k in batch:          # fallback: one by one
+                    client.delete_object(Bucket=_bucket(), Key=k)
         return True
     except Exception:
         return False
