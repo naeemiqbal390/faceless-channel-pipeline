@@ -138,6 +138,26 @@ STYLE_PRESETS = {
             "background, scenery, multiple figures merged together"
         ),
     },
+    "Stick Figure Doodle (colour scenes)": {
+        "prompt": (
+            "Simple hand-drawn doodle cartoon with flat colors, whiteboard-"
+            "animation look. The hero is a stick-figure person: round white "
+            "head with a bold black outline, two small black dot eyes, a tiny "
+            "line mouth, thin black line body and limbs, hands and feet as "
+            "simple hooked lines, wearing only the items the scene names. "
+            "Scenery and props are drawn in the same loose doodle style with "
+            "thick black outlines and simple flat color fills: green grass, "
+            "blue sky, grey roads, houses and objects, minimal detail, no "
+            "shading, no gradients. Bright clean colors, one clear focal "
+            "subject. Scene: "
+        ),
+        "negative": (
+            "photorealistic, 3d render, realistic anatomy, shading, gradient, "
+            "painting, watercolor, airbrush, anime, detailed face, fingers, "
+            "muscles, realistic human, cinematic lighting, film grain, "
+            "blurry, noise, text, letters, words, extra limbs, two heads"
+        ),
+    },
     "Anime / Hand-Painted (Ghibli-inspired)": {
         "prompt": (
             "Hand-painted 2D animated-film still in a soft, warm, "
