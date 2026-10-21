@@ -391,6 +391,7 @@ def _attempt_generate(account_id, api_token, model_name, prompt_text, negative_p
         payload = {
             "prompt": prompt_text[:FLUX_MAX_PROMPT_CHARS],
             "steps": FLUX_STEPS,
+            "seed": random.randint(1, 2_147_483_647),   # fresh seed, so a retry gives a different picture
         }
     else:
         payload = {
