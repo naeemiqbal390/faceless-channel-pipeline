@@ -113,6 +113,24 @@ UNIVERSAL_NEGATIVE = (
 )
 
 STYLE_PRESETS = {
+    "Money POV Cartoon (clean 2D, warm light)": {
+        "prompt": (
+            "Clean modern 2D cartoon illustration, western editorial-cartoon "
+            "look. Thin dark outlines, smooth soft cel shading, simple "
+            "friendly faces with round eyes and clear expressions, natural "
+            "proportions. Detailed everyday suburban or city backgrounds "
+            "(driveways, houses, dealerships, cafes, offices) with warm "
+            "golden-hour light, rich but natural colors, tidy composition, "
+            "one clear focal subject, at most three characters. Scene: "
+        ),
+        "negative": (
+            "photorealistic, 3d render, cgi, photography, anime, chibi, "
+            "heavy black outlines, harsh shading, neon colors, "
+            "oversaturated, glossy, airbrushed, sexualized, exaggerated "
+            "anatomy, blurry, low detail, abstract, text, letters, words, "
+            "watermark, extra limbs, extra fingers, two heads, merged figures"
+        ),
+    },
     "Stick Figure": {
         "prompt": (
             "Simple hand-drawn stick figure illustration, whiteboard-animation "
@@ -208,7 +226,7 @@ STYLE_PRESETS = {
         "negative": "cartoon, illustration, line art, painting, low detail, blurry, abstract",
     },
 }
-DEFAULT_STYLE = "Stick Figure"
+DEFAULT_STYLE = "Money POV Cartoon (clean 2D, warm light)"
 
 ANATOMY_POSITIVE = (
     "Correct, coherent anatomy: exactly one head, exactly one face, "
