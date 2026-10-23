@@ -243,3 +243,55 @@ def regenerate_scenes(manifest_path, scene_ids, style, accounts, mode="auto",
                     results[rest] = {"ok": False, "how": "", "prompt": "", "error": err}
                 break
     return results
+
+
+# ---------------------------------------------------------------- one-screen review grid
+SMALL_W = 170
+
+
+def small_thumb_b64(image_path, cache_dir):
+    """(base64 JPEG ~170px wide, looks_blank). Cached on disk, rebuilt only when the picture changes."""
+    import base64
+    try:
+        from PIL import Image, ImageStat
+        os.makedirs(cache_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(image_path))[0]
+        t = os.path.join(cache_dir, f"s_{stem}.jpg")
+        if not (os.path.exists(t) and os.path.getmtime(t) >= os.path.getmtime(image_path)):
+            with Image.open(image_path) as im:
+                im = im.convert("RGB")
+                h = max(1, int(im.height * SMALL_W / im.width))
+                im.resize((SMALL_W, h)).save(t, "JPEG", quality=60)
+        with Image.open(t) as im2:
+            g = im2.convert("L").resize((32, 32))
+        stt = ImageStat.Stat(g)
+        blank = stt.mean[0] < 8 and g.getextrema()[1] < 40
+        with open(t, "rb") as f:
+            return base64.b64encode(f.read()).decode("ascii"), blank
+    except Exception:
+        return "", False
+
+
+def review_grid_html(images_dir, scene_ids, redone_ids, min_px=70):
+    """One HTML block holding EVERY picture as a small tile with its scene number on it. Blank (black)
+    pictures get a red border and a warning sign. Returns (html, blank_ids)."""
+    cache_dir = os.path.join(os.path.dirname(images_dir), "thumbs")
+    redone = set(str(i) for i in redone_ids)
+    cells, blanks = [], []
+    for sid in scene_ids:
+        p = os.path.join(images_dir, f"scene_{sid:03d}.png")
+        if not os.path.exists(p):
+            continue
+        b64, blank = small_thumb_b64(p, cache_dir)
+        if blank:
+            blanks.append(sid)
+        tag = f"{sid}" + (" ✎" if str(sid) in redone else "") + (" ⚠" if blank else "")
+        border = "outline:3px solid #e53935;" if blank else ""
+        cells.append(
+            f'<div style="position:relative;{border}border-radius:4px">'
+            f'<img src="data:image/jpeg;base64,{b64}" style="width:100%;display:block;border-radius:4px"/>'
+            f'<span style="position:absolute;left:2px;top:2px;background:rgba(0,0,0,.7);color:#fff;'
+            f'font-size:11px;line-height:14px;padding:0 4px;border-radius:3px">{tag}</span></div>')
+    html = (f'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax({min_px}px,1fr));'
+            f'gap:4px">' + "".join(cells) + "</div>")
+    return html, blanks
