@@ -395,6 +395,19 @@ class ContentFilterError(RuntimeError):
     pass
 
 
+def _is_blank_image(path):
+    """True for a solid black (or nearly black) picture. Cloudflare's safety filter can hand back a black
+    image instead of an error, and the app used to save it as if it were fine."""
+    try:
+        from PIL import Image, ImageStat
+        with Image.open(path) as im:
+            g = im.convert("L").resize((48, 48))
+        st_ = ImageStat.Stat(g)
+        return st_.mean[0] < 8 and g.getextrema()[1] < 40
+    except Exception:
+        return False
+
+
 # Gentle replacements for words that commonly trip automated image filters.
 _SOFTEN_MAP = [
     ("dead bodies", "sleeping figures"), ("dead body", "resting figure"), ("corpses", "resting figures"),
@@ -498,8 +511,16 @@ def _generate_with_fallback(account_id, api_token, model_state, prompt_text, neg
         for local_attempt in range(2):
             try:
                 _attempt_generate(account_id, api_token, model_name, prompt_text, negative_prompt, out_path)
+                if _is_blank_image(out_path):
+                    try:
+                        os.remove(out_path)
+                    except Exception:
+                        pass
+                    raise ContentFilterError("a blank black picture came back (treated like a content-filter block)")
                 rate_limiter.record_success()
                 return
+            except ContentFilterError:
+                raise
             except Exception as e:
                 err_text = str(e)
                 kind = _classify_error(err_text)
