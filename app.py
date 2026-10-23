@@ -864,6 +864,13 @@ def show_jobs_panel():
                 _render_job(kind, j)
 
 
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _review_grid_cached(images_dir, signature, scene_ids, redone_ids, min_px):
+    import scene_fixer
+    return scene_fixer.review_grid_html(images_dir, list(scene_ids), list(redone_ids), min_px)
+
+
 # Interface setup
 st.set_page_config(page_title="Faceless Channel Pipeline", layout="centered")
 st.markdown("""<style>
@@ -994,12 +1001,7 @@ with tab0:
         images_d = st.session_state.get("images_dir")
         if images_d and os.path.isdir(images_d):
             all_pngs = sorted(f for f in os.listdir(images_d) if f.lower().endswith(".png"))
-            with st.expander(f"{len(all_pngs)} image(s) available — click to review", expanded=False):
-                # Building this grid sends ~0.5 MB of HTML to the browser on every click, even while the
-                # expander is closed, so it only loads when ticked.
-                if st.checkbox("Load thumbnails", key="show_status_gallery", value=False):
-                    status_gallery_placeholder = st.empty()
-                    make_image_gallery(status_gallery_placeholder, images_d, max_shown=40)()
+            st.caption(f"{len(all_pngs)} picture(s) ready. Check all of them at once in the Review tab.")
         video_p = st.session_state.get("video_path")
         if video_p and os.path.exists(video_p):
             show_video_preview(video_p, "tab0_status")
@@ -1245,27 +1247,23 @@ with tab_review:
         else:
             st.success(f"All {len(_rv_ids)} pictures exist.")
 
-        # ---- gallery -----------------------------------------------------
-        _PER = 12
-        _pages = max(1, -(-len(_rv_have) // _PER))
-        gc1 = gc2 = gc3 = st
-        _page = gc1.number_input("Page", min_value=1, max_value=_pages, value=1, step=1, key="rv_page")
-        _show_prompts = gc2.checkbox("Show prompts", value=False, key="rv_prompts")
-        gc3.caption(f"Page {_page} of {_pages}: scenes "
-                    f"{(_rv_have[(_page - 1) * _PER] if _rv_have else 0)}-"
-                    f"{(_rv_have[min(_page * _PER, len(_rv_have)) - 1] if _rv_have else 0)}. "
-                    f"Pictures marked ✎ were redone before.")
-        _thumb_dir = os.path.join(os.path.dirname(_rv_dir), "thumbs")
-        _chunk = _rv_have[(_page - 1) * _PER: _page * _PER]
-        for _row_start in range(0, len(_chunk), 3):
-            _cols = st.columns(3)
-            for _c, _sid in zip(_cols, _chunk[_row_start:_row_start + 3]):
-                with _c:
-                    _tp = scene_fixer.make_thumb(os.path.join(_rv_dir, f"scene_{_sid:03d}.png"), _thumb_dir)
-                    st.image(_tp, caption=f"Scene {_sid}" + (" ✎" if str(_sid) in _rv_fixes else ""),
-                             use_container_width=True)
-                    if _show_prompts:
-                        st.caption(_rv_prompts.get(_sid, "")[:140])
+        # ---- every picture on one screen ---------------------------------------
+        _size = st.radio("Picture size", ["Small", "Medium", "Large"], horizontal=True, key="rv_size",
+                         help="Small fits the most pictures on one screen.")
+        _px = {"Small": 70, "Medium": 110, "Large": 170}[_size]
+        _sig = hashlib.md5(",".join(f"{i}:{os.path.getmtime(os.path.join(_rv_dir, f'scene_{i:03d}.png')):.0f}"
+                                    for i in _rv_have).encode()).hexdigest()
+        _grid_html, _blank_ids = _review_grid_cached(_rv_dir, _sig, tuple(_rv_have),
+                                                     tuple(int(k) for k in _rv_fixes), _px)
+        st.caption(f"All {len(_rv_have)} pictures, newest scene numbers last. ✎ = redone before. "
+                   f"Red border and ⚠ = a blank (black) picture.")
+        st.markdown(_grid_html, unsafe_allow_html=True)
+        if _blank_ids:
+            st.error(f"{len(_blank_ids)} blank (black) picture(s): {_blank_ids}")
+            if st.button("Put the blank ones in the redo box", key="rv_blank_btn"):
+                st.session_state["_fix_box_next"] = ", ".join(str(i) for i in _blank_ids)
+                st.rerun()
+        _show_prompts = False
 
         # ---- close look ----------------------------------------------------
         _look = st.number_input("Look closely at scene (0 = none)", min_value=0,
