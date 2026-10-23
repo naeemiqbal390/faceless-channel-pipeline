@@ -165,7 +165,6 @@ def regenerate_scenes(manifest_path, scene_ids, style, accounts, mode="auto",
     fixes = load_fixes(images_dir)
 
     cfg = cr.STYLE_PRESETS.get(style, cr.STYLE_PRESETS[cr.DEFAULT_STYLE])
-    prefix = cfg["prompt"] + cr.ANATOMY_POSITIVE
     negative = cfg.get("negative", "") + ", " + cr.UNIVERSAL_NEGATIVE
 
     pool = cr._AccountPool(accounts)
@@ -201,7 +200,7 @@ def regenerate_scenes(manifest_path, scene_ids, style, accounts, mode="auto",
             use = base if not soften else cr._soften_prompt(base, soften)
             try:
                 limiter.wait()
-                cr._generate_with_fallback(acct_id, acct_token, model_state, prefix + use, negative,
+                cr._generate_with_fallback(acct_id, acct_token, model_state, cr.compose_prompt(cfg, use), negative,
                                            tmp_path, limiter)
                 os.replace(tmp_path, out_path)      # swap in only after a good image exists
                 done = True
