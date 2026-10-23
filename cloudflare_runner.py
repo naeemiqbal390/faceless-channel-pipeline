@@ -114,21 +114,26 @@ UNIVERSAL_NEGATIVE = (
 
 STYLE_PRESETS = {
     "Money POV Cartoon (clean 2D, warm light)": {
+        "scene_first": True,
+        "style": (
+            "Style: clean modern 2D cartoon illustration with thin dark "
+            "outlines, smooth soft cel shading, simple friendly faces with "
+            "round eyes, natural proportions, warm golden light and rich "
+            "natural colors, tidy composition. Every person in the scene is "
+            "shown clearly and large in the foreground."
+        ),
         "prompt": (
-            "Clean modern 2D cartoon illustration, western editorial-cartoon "
-            "look. Thin dark outlines, smooth soft cel shading, simple "
-            "friendly faces with round eyes and clear expressions, natural "
-            "proportions. Detailed everyday suburban or city backgrounds "
-            "(driveways, houses, dealerships, cafes, offices) with warm "
-            "golden-hour light, rich but natural colors, tidy composition, "
-            "one clear focal subject, at most three characters. Scene: "
+            "Clean modern 2D cartoon illustration with thin dark outlines, "
+            "smooth soft cel shading, simple friendly faces, warm golden "
+            "light. Scene: "
         ),
         "negative": (
             "photorealistic, 3d render, cgi, photography, anime, chibi, "
             "heavy black outlines, harsh shading, neon colors, "
             "oversaturated, glossy, airbrushed, sexualized, exaggerated "
             "anatomy, blurry, low detail, abstract, text, letters, words, "
-            "watermark, extra limbs, extra fingers, two heads, merged figures"
+            "watermark, extra limbs, extra fingers, two heads, merged "
+            "figures, empty street, no people"
         ),
     },
     "Stick Figure": {
@@ -233,6 +238,15 @@ ANATOMY_POSITIVE = (
     "the correct number of limbs, symmetrical features, natural "
     "proportions. "
 )
+
+
+def compose_prompt(style_config, scene_text):
+    """Final prompt sent to the image model. Most styles put the style text first. A style with
+    "scene_first" puts the scene FIRST and the (short) style after it, so a long style description can
+    never drown out what the picture is supposed to show."""
+    if style_config.get("scene_first"):
+        return scene_text.strip().rstrip(".") + ". " + style_config["style"] + " " + ANATOMY_POSITIVE
+    return style_config["prompt"] + ANATOMY_POSITIVE + scene_text
 
 
 # --------------------------------------------------------------------------
@@ -553,7 +567,7 @@ class _AccountPool:
 
 
 def run_image_generation(manifest_path, api_key=None, progress_callback=None, style=DEFAULT_STYLE,
-                          on_image_saved=None, account_id=None, accounts=None):
+                          on_image_saved=None, account_id=None, accounts=None, should_stop=None):
     """
     Generates one image per manifest row via Cloudflare Workers AI.
 
@@ -577,7 +591,6 @@ def run_image_generation(manifest_path, api_key=None, progress_callback=None, st
     softened = {}
 
     style_config = STYLE_PRESETS.get(style, STYLE_PRESETS[DEFAULT_STYLE])
-    style_prefix = style_config["prompt"] + ANATOMY_POSITIVE
     negative_prompt = style_config.get("negative", "") + ", " + UNIVERSAL_NEGATIVE
 
     df = _load_manifest_df(manifest_path)
@@ -616,7 +629,9 @@ def run_image_generation(manifest_path, api_key=None, progress_callback=None, st
         rate_limiter.wait()
         level = 0
         while True:
-            full_prompt = style_prefix + (_soften_prompt(prompt, level) if level else prompt)
+            if should_stop and should_stop():
+                return False
+            full_prompt = compose_prompt(style_config, _soften_prompt(prompt, level) if level else prompt)
             acct = pool.current()
             if acct is None:
                 quota_exhausted = True
@@ -682,6 +697,9 @@ def run_image_generation(manifest_path, api_key=None, progress_callback=None, st
 
     failed = []
     for scene_id, prompt, out_path in pending:
+        if should_stop and should_stop():
+            failed.append((scene_id, prompt, out_path))
+            continue
         if quota_exhausted:
             # No point burning through remaining scenes one-by-one once the
             # account-wide daily budget is confirmed gone — park the rest
@@ -697,7 +715,7 @@ def run_image_generation(manifest_path, api_key=None, progress_callback=None, st
                            "parked. Quotas reset at 00:00 UTC (05:00 Pakistan); come back and click Resume.")
 
     round_num = 1
-    while failed and round_num <= RETRY_ROUNDS and not quota_exhausted:
+    while failed and round_num <= RETRY_ROUNDS and not quota_exhausted and not (should_stop and should_stop()):
         if progress_callback:
             progress_callback(done_images, total_images,
                                f"Retry round {round_num}/{RETRY_ROUNDS} — {len(failed)} scene(s) remaining.")
