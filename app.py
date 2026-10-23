@@ -746,25 +746,159 @@ def make_image_gallery(container, images_dir, cols=5, max_shown=15):
     return _refresh
 
 
+
+# ---------------------------------------------------------------------------------------------------
+# Background jobs: image generation and video building run on the server in their own thread, so they
+# keep going when you switch tabs/windows, close the page or click anything. See bg_jobs.py.
+# ---------------------------------------------------------------------------------------------------
+import bg_jobs
+
+
+def start_image_job(manifest_path, accounts, style):
+    import cloudflare_runner
+    script = st.session_state.get("script_text", "")
+    pid = compute_project_id(script) if script else None
+    meta = {"script_text": script, "manifest_path": manifest_path, "style": style,
+            "audio_path": st.session_state.get("audio_path"),
+            "images_dir": cloudflare_runner.get_images_dir(manifest_path)}
+    job, started = bg_jobs.start_job("images", bg_jobs.images_job_target(manifest_path, accounts, style, pid), meta)
+    return started
+
+
+def attach_background_jobs():
+    """A new browser session (after a reconnect or a second window) has none of the old session's state.
+    If a job is, or was, running on the server, pick its project paths up so nothing needs resuming."""
+    for kind in ("images", "video"):
+        j = bg_jobs.get_job(kind)
+        if not j:
+            continue
+        for k in ("script_text", "manifest_path", "audio_path", "images_dir"):
+            v = j["meta"].get(k)
+            cur = st.session_state.get(k)
+            if v and (not cur or (k != "script_text" and isinstance(cur, str) and not os.path.exists(cur))):
+                st.session_state[k] = v
+        if j["status"] == "running":
+            continue
+        key = "applied_" + j["id"]
+        if st.session_state.get(key):
+            continue
+        st.session_state[key] = True
+        if kind == "images":
+            res = j["result"] or {}
+            if res.get("images_dir"):
+                st.session_state["images_dir"] = res["images_dir"]
+            st.session_state["images_reviewed"] = False
+            get_project_status.clear()
+        elif kind == "video" and j["result"]:
+            st.session_state["video_path"] = j["result"]["path"]
+            st.session_state["video_filled"] = j["result"]["filled"]
+
+
+def _render_job(kind, j):
+    label = {"images": "Pictures", "video": "Video"}.get(kind, kind)
+    done, total = j["done"], j["total"]
+    pct = min(done / total, 1.0) if total else 0.0
+    if j["status"] == "running":
+        st.info(f"**{label} are being made on the server.** You can switch tabs or windows, or click around, "
+                f"and it keeps going. Progress: {done}/{total}.")
+        st.progress(pct)
+        st.caption(j["msg"])
+        if st.button(f"Stop {label.lower()}", key=f"stop_{kind}"):
+            bg_jobs.request_stop(kind)
+    else:
+        if j["status"] == "error":
+            st.error(f"{label} stopped with an error: {j['error']}")
+        elif j["status"] == "stopped":
+            st.warning(f"{label} were stopped at {done}/{total}. Everything made so far is saved.")
+        elif kind == "images":
+            m = j["meta"].get("manifest_path")
+            missing, failed = 0, (j["result"] or {}).get("failed", [])
+            try:
+                import cloudflare_runner
+                s_ = cloudflare_runner.get_resume_status(m)
+                missing = s_["total_images"] - s_["done_images"]
+                done, total = s_["done_images"], s_["total_images"]
+            except Exception:
+                pass
+            if missing > 0 or failed:
+                st.error(f"{done}/{total} pictures done, {missing} still missing (most likely today's free Cloudflare "
+                         f"quota ran out). Everything is saved. After 05:00 Pakistan time press Generate Images "
+                         f"again; only the missing ones are made. The video is built only when all pictures exist.")
+            else:
+                st.success(f"All {total} pictures are ready. Open the Review tab, check them, fix any bad ones "
+                           f"by scene number, then build the video in the Video tab.")
+        else:
+            filled = (j["result"] or {}).get("filled", [])
+            if filled:
+                st.warning(f"Video built, but {len(filled)} scene(s) had no picture of their own and borrowed a "
+                           f"neighbour's: {filled[:30]}.")
+            else:
+                st.success("Video built. Preview and download it in the Video tab.")
+        if st.button("Hide this message", key=f"hide_{kind}"):
+            bg_jobs.clear_job(kind)
+            st.rerun()
+    with st.expander("Activity log", expanded=False):
+        st.code("\n".join(list(j["log"])[-25:]) or "(nothing yet)", language=None)
+
+
+@st.fragment(run_every=3)
+def _live_jobs_panel():
+    """Refreshes by itself every 3 seconds while a job runs (only this block reruns, not the whole page)."""
+    anything = False
+    for kind in ("images", "video"):
+        j = bg_jobs.get_job(kind)
+        if j:
+            anything = True
+            _render_job(kind, j)
+    if anything and not bg_jobs.is_running():
+        st.rerun()
+
+
+def show_jobs_panel():
+    if bg_jobs.is_running():
+        _live_jobs_panel()
+    else:
+        for kind in ("images", "video"):
+            j = bg_jobs.get_job(kind)
+            if j:
+                _render_job(kind, j)
+
+
 # Interface setup
-st.set_page_config(page_title="Faceless Channel Pipeline", layout="wide")
+st.set_page_config(page_title="Faceless Channel Pipeline", layout="centered")
+st.markdown("""<style>
+.block-container{padding-top:1.2rem;padding-bottom:3rem}
+h1{font-size:1.6rem !important}
+.stTabs [data-baseweb="tab-list"]{overflow-x:auto}
+@media (max-width:640px){
+  /* keep short rows (buttons, picture grids) side by side on a phone instead of stacking */
+  div[data-testid="stHorizontalBlock"]{flex-direction:row !important;flex-wrap:wrap !important;gap:.5rem !important}
+  div[data-testid="stColumn"],div[data-testid="column"]{min-width:30% !important;flex:1 1 30% !important;width:auto !important}
+  .stButton>button,.stDownloadButton>button{min-height:2.8rem;width:100%}
+}
+</style>""", unsafe_allow_html=True)
 st.title("Faceless Channel Pipeline")
-st.caption("Stick-figure style · unlimited characters · zero cost")
 
 if "manifest_path" not in st.session_state:
     st.session_state["manifest_path"] = None
 
 autoload_last_project()
+if not st.session_state.get("status_cache_reset"):
+    # a brand-new browser session must never trust an old (up to 15 min) cached Backblaze listing
+    get_project_status.clear()
+    st.session_state["status_cache_reset"] = True
+attach_background_jobs()
+show_jobs_panel()
 if st.session_state.get("autoloaded_project"):
     st.success("Reopened your last project exactly where you left it. Use the tabs below to continue.")
 
 tab0, tab_audio, tab_align, tab_images, tab_review, tab_video, tab_thumb = st.tabs(
-    ["1. Paste script", "2. Audio", "3. Align", "4. Images", "5. Review", "6. Video", "7. Thumbnail"]
+    ["Script", "Audio", "Align", "Images", "Review", "Video", "Thumbnail"]
 )
 
 with tab0:
     st.markdown("Paste the finished script here to start the automated workflow.")
-    pasted_script = st.text_area("Script", st.session_state.get("script_text", ""), height=400)
+    pasted_script = st.text_area("Script", st.session_state.get("script_text", ""), height=240)
     col_a, col_b = st.columns(2)
     if col_a.button("Save script", type="primary"):
         if "[SCENE" not in pasted_script:
@@ -794,25 +928,35 @@ with tab0:
                     "video: not stored (rebuilt from the pictures)",
                 ]
                 st.info(f"Saved progress found for this script: {', '.join(status_bits)}")
-                resume_col, clear_col = st.columns(2)
-                if resume_col.button("Resume — load saved progress", type="primary"):
-                    with st.spinner("Downloading saved progress from B2..."):
-                        st.session_state["resume_summary"] = resume_project_from_b2(check_project_id)
-                    get_project_status.clear()
-                    st.rerun()
-                if clear_col.button("Clear saved progress — back to stage 1"):
-                    b2_storage.delete_prefix(f"projects/{check_project_id}/")
-                    get_project_status.clear()
-                    try:
-                        b2_storage.delete_prefix("projects/_latest.json")
-                    except Exception:
-                        pass
-                    st.session_state["autoload_done"] = True
-                    for key in ["script_text", "audio_path", "manifest_path", "images_dir",
-                                "video_path", "project_id", "resume_summary"]:
-                        st.session_state.pop(key, None)
-                    st.success("Cleared. Starting over.")
-                    st.rerun()
+            else:
+                st.caption("No saved progress was found on Backblaze for this script. If you just came back "
+                           "after a disconnect, press 'Check again' (the check can be a few minutes old).")
+            if bg_jobs.is_running():
+                st.warning("A job is running on the server right now, and its pictures are saved as they are made. "
+                           "You do not need to resume. (Loading saved progress is paused until it finishes.)")
+            resume_col = clear_col = check_col = st
+            if resume_col.button("Resume — load saved progress", type="primary", disabled=bg_jobs.is_running()):
+                with st.spinner("Downloading saved progress from B2..."):
+                    st.session_state["resume_summary"] = resume_project_from_b2(check_project_id)
+                get_project_status.clear()
+                st.rerun()
+            if check_col.button("Check again"):
+                get_project_status.clear()
+                st.rerun()
+            if project_status and clear_col.button("Clear saved progress — back to stage 1",
+                                                   disabled=bg_jobs.is_running()):
+                b2_storage.delete_prefix(f"projects/{check_project_id}/")
+                get_project_status.clear()
+                try:
+                    b2_storage.delete_prefix("projects/_latest.json")
+                except Exception:
+                    pass
+                st.session_state["autoload_done"] = True
+                for key in ["script_text", "audio_path", "manifest_path", "images_dir",
+                            "video_path", "project_id", "resume_summary"]:
+                    st.session_state.pop(key, None)
+                st.success("Cleared. Starting over.")
+                st.rerun()
         else:
             st.caption("Add B2_KEY_ID / B2_APPLICATION_KEY / B2_BUCKET_NAME / B2_ENDPOINT_URL to Secrets to "
                        "enable save/resume across sessions and restarts.")
@@ -861,23 +1005,14 @@ with tab0:
             show_video_preview(video_p, "tab0_status")
 
     st.divider()
-    st.checkbox("Show live image gallery while generating (turn off if the app gets throttled)",
-                value=True, key="show_live_gallery")
-    voice_auto = st.selectbox("Voice", EDGE_TTS_VOICES, key="voice_auto")
-
     import cloudflare_runner
     style_options = list(cloudflare_runner.STYLE_PRESETS.keys())
-    style_auto = st.selectbox("Image style", style_options, key="style_auto")
+    with st.expander("Voice and picture style", expanded=False):
+        voice_auto = st.selectbox("Voice", EDGE_TTS_VOICES, key="voice_auto")
+        style_auto = st.selectbox("Image style", style_options, key="style_auto")
     st.session_state["image_style"] = style_auto
-
-    cloudflare_account_auto = st.text_input(
-        "Cloudflare Account ID (optional — or set CLOUDFLARE_ACCOUNT_ID in Secrets)",
-        key="cfa_auto",
-    )
-    cloudflare_token_auto = st.text_input(
-        "Cloudflare API token (optional — or set CLOUDFLARE_API_TOKEN in Secrets)",
-        type="password", key="cft_auto",
-    )
+    cloudflare_account_auto = ""
+    cloudflare_token_auto = ""
 
     if col_b.button("Run full pipeline", type="primary"):
         if "[SCENE" not in pasted_script:
@@ -923,85 +1058,24 @@ with tab0:
                 if not cloudflare_accounts:
                     raise ValueError(
                         "Cloudflare credentials missing — add CLOUDFLARE_ACCOUNT_ID and "
-                        "CLOUDFLARE_API_TOKEN to Secrets (or enter them in the fields above)."
+                        "CLOUDFLARE_API_TOKEN (and _2, _3 for more accounts) to the app's Secrets."
                     )
-                st.caption("Image account order: " + " → ".join(a[0] for a in cloudflare_accounts)
-                           + ". Each is used until its daily quota is gone, then the next takes over.")
-
                 active_manifest = st.session_state.get("manifest_path")
                 if not active_manifest or not os.path.exists(active_manifest):
                     raise ValueError("Manifest path unresolved or non-existent.")
-
-                # Must normalize BEFORE computing the images directory — it's
-                # hashed from the file's bytes, and normalizing changes those
-                # bytes (line endings/encoding) even for an already-valid
-                # file. Doing this after previewing the gallery directory
-                # made the preview point at a different folder than the one
-                # generation actually wrote to.
+                # Normalize BEFORE computing the images directory (it is hashed from the file's bytes).
                 force_fix_manifest_csv(active_manifest)
-                images_dir_preview = cloudflare_runner.get_images_dir(active_manifest)
-
-                log_col, gallery_col = st.columns([2, 3])
-                with log_col:
-                    image_bar = st.progress(0.0)
-                    image_status = st.empty()
-                image_log = make_progress_log(image_status)
-                with gallery_col:
-                    st.caption("Generated so far (most recent):")
-                    gallery_placeholder = st.empty()
-                refresh_gallery = make_image_gallery(gallery_placeholder, images_dir_preview)
-                if not st.session_state.get("show_live_gallery", True):
-                    _g = refresh_gallery
-                    refresh_gallery = lambda force=False: (_g(force=True) if force else None)
-                refresh_gallery()
-
-                def on_image_progress(done_images, total_images, message):
-                    pct = done_images / total_images if total_images else 0
-                    image_bar.progress(min(pct, 1.0))
-                    image_log(f"{done_images}/{total_images} images generated — {message}")
-                    refresh_gallery()
-
-                _bg_submit, _bg_finish = make_background_uploader()
-
-                def on_image_saved(scene_id, local_path):
-                    _bg_submit(local_path, f"scene_images/{os.path.basename(local_path)}")
-
                 invalidate_saved_video(active_manifest)
-                images_dir, zip_path, failed_scenes = cloudflare_runner.run_image_generation(
-                    active_manifest, progress_callback=on_image_progress,
-                    style=st.session_state.get("image_style", cloudflare_runner.DEFAULT_STYLE),
-                    on_image_saved=on_image_saved,
-                    accounts=cloudflare_accounts,
-                )
-                st.session_state["images_dir"] = images_dir
-                refresh_gallery(force=True)
-                _bg_finish()
-                sync_images_to_b2(images_dir)
-                get_project_status.clear()
-                st.session_state["images_reviewed"] = False
-                _status = cloudflare_runner.get_resume_status(active_manifest)
-                _missing = _status["total_images"] - _status["done_images"]
-                if _missing > 0 or failed_scenes:
-                    image_bar.progress(min(_status["done_images"] / max(_status["total_images"], 1), 1.0))
-                    st.error(
-                        f"Stopped before the video: {_status['done_images']}/{_status['total_images']} images are done, "
-                        f"{_missing} still missing (likely today's free Cloudflare quota ran out). "
-                        f"Nothing is lost — everything is saved. Come back after 05:00 Pakistan time "
-                        f"(00:00 UTC, when the quota resets), reopen the app and press Resume. "
-                        f"The video will only be built once ALL images exist.")
-                    with open(zip_path, "rb") as f:
-                        st.download_button("Download images so far (zip)", f, file_name="scene_images_batch.zip",
-                                            mime="application/zip", key="dl_images_pipeline_partial")
-                    st.stop()
-                image_bar.progress(1.0)
-                st.success("All images generated.")
-                with open(zip_path, "rb") as f:
-                    st.download_button("Download scene_images_batch.zip", f, file_name="scene_images_batch.zip",
-                                        mime="application/zip", key="dl_images_pipeline")
-
-                st.markdown("**Step 4/4 — check the pictures**")
-                st.success("All images are ready. Open the 5. Review tab, look through the pictures, fix any "
-                           "bad ones by scene number, then build the video in the 6. Video tab.")
+                if bg_jobs.is_running("images"):
+                    st.info("Pictures are already being made in the background (see the top of the page).")
+                elif start_image_job(active_manifest, cloudflare_accounts,
+                                     st.session_state.get("image_style", cloudflare_runner.DEFAULT_STYLE)):
+                    st.session_state["images_reviewed"] = False
+                    st.success("Picture generation started on the server. Account order: "
+                               + " → ".join(a[0] for a in cloudflare_accounts)
+                               + ". You can now switch tabs or windows; progress shows at the top of the page.")
+                    time.sleep(1)
+                    st.rerun()
 
             except Exception as e:
                 st.error(f"Pipeline stopped: {e}")
@@ -1009,9 +1083,9 @@ with tab0:
 with tab_audio:
     saved_script = st.session_state.get("script_text", "")
     if not saved_script:
-        st.warning("No script saved yet — paste and save your script in tab 1 first.")
+        st.warning("No script saved yet — paste and save your script in the Script tab first.")
     else:
-        with st.expander("Script being used (edit it in tab 1, not here)"):
+        with st.expander("Script being used (edit it in the Script tab, not here)"):
             st.text_area("Script", saved_script, height=200, key="audio_script_preview", disabled=True)
 
     voice = st.selectbox("Voice", EDGE_TTS_VOICES)
@@ -1041,9 +1115,9 @@ with tab_audio:
 with tab_align:
     saved_script2 = st.session_state.get("script_text", "")
     if not saved_script2:
-        st.warning("No script saved yet — paste and save your script in tab 1 first.")
+        st.warning("No script saved yet — paste and save your script in the Script tab first.")
     else:
-        with st.expander("Script being used (edit it in tab 1, not here)"):
+        with st.expander("Script being used (edit it in the Script tab, not here)"):
             st.text_area("Script", saved_script2, height=200, key="align_script_preview", disabled=True)
 
     uploaded_audio = st.file_uploader("Finished audio (optional)", type=["mp3", "wav"])
@@ -1102,14 +1176,8 @@ with tab_images:
     else:
         st.warning("No active manifest found. Upload or generate a CSV manifest.")
 
-    cloudflare_account_override = st.text_input(
-        "Cloudflare Account ID (optional — or set CLOUDFLARE_ACCOUNT_ID in Secrets)",
-        key="tab_images_account",
-    )
-    cloudflare_token_override = st.text_input(
-        "Cloudflare API token (optional — or set CLOUDFLARE_API_TOKEN in Secrets)",
-        type="password", key="tab_images_key",
-    )
+    cloudflare_account_override = ""
+    cloudflare_token_override = ""
 
     import cloudflare_runner
     style_options = list(cloudflare_runner.STYLE_PRESETS.keys())
@@ -1118,7 +1186,8 @@ with tab_images:
     style_override = st.selectbox("Image style", style_options, index=default_index, key="tab_images_style")
     st.session_state["image_style"] = style_override
 
-    if st.button("Generate Images", type="primary"):
+    _img_running = bg_jobs.is_running("images")
+    if st.button("Generate Images", type="primary", disabled=_img_running):
         if not active_manifest_path or not os.path.exists(active_manifest_path):
             st.error("Missing manifest file! Please upload a CSV or run alignment.")
         else:
@@ -1127,77 +1196,26 @@ with tab_images:
                 if not cloudflare_accounts:
                     raise ValueError(
                         "Cloudflare credentials missing — add CLOUDFLARE_ACCOUNT_ID and "
-                        "CLOUDFLARE_API_TOKEN to Secrets (or enter them in the fields above)."
+                        "CLOUDFLARE_API_TOKEN (and _2, _3 for more accounts) to the app's Secrets."
                     )
-                st.caption("Image account order: " + " → ".join(a[0] for a in cloudflare_accounts)
-                           + ". Each is used until its daily quota is gone, then the next takes over.")
-
-                import cloudflare_runner
                 force_fix_manifest_csv(active_manifest_path)
-                images_dir_preview = cloudflare_runner.get_images_dir(active_manifest_path)
-
-                log_col, gallery_col = st.columns([2, 3])
-                with log_col:
-                    image_bar = st.progress(0.0)
-                    image_status = st.empty()
-                image_log = make_progress_log(image_status)
-                with gallery_col:
-                    st.caption("Generated so far (most recent):")
-                    gallery_placeholder = st.empty()
-                refresh_gallery = make_image_gallery(gallery_placeholder, images_dir_preview)
-                if not st.session_state.get("show_live_gallery", True):
-                    _g = refresh_gallery
-                    refresh_gallery = lambda force=False: (_g(force=True) if force else None)
-                refresh_gallery()
-
-                def on_image_progress(done_images, total_images, message):
-                    pct = done_images / total_images if total_images else 0
-                    image_bar.progress(min(pct, 1.0))
-                    image_log(f"{done_images}/{total_images} images generated — {message}")
-                    refresh_gallery()
-
-                _bg_submit, _bg_finish = make_background_uploader()
-
-                def on_image_saved(scene_id, local_path):
-                    _bg_submit(local_path, f"scene_images/{os.path.basename(local_path)}")
-
                 invalidate_saved_video(active_manifest_path)
-                images_dir, zip_path, failed_scenes = cloudflare_runner.run_image_generation(
-                    active_manifest_path, progress_callback=on_image_progress,
-                    style=style_override,
-                    on_image_saved=on_image_saved,
-                    accounts=cloudflare_accounts,
-                )
-                st.session_state["images_dir"] = images_dir
-
-                refresh_gallery(force=True)
-                _bg_finish()
-                sync_images_to_b2(images_dir)
-                get_project_status.clear()
-                st.session_state["images_reviewed"] = False
-                _status = cloudflare_runner.get_resume_status(active_manifest_path)
-                _missing = _status["total_images"] - _status["done_images"]
-                if _missing > 0 or failed_scenes:
-                    image_bar.progress(min(_status["done_images"] / max(_status["total_images"], 1), 1.0))
-                    st.error(
-                        f"{_status['done_images']}/{_status['total_images']} images done, {_missing} missing "
-                        f"(likely today's free quota ran out). Everything is saved. After 05:00 Pakistan time "
-                        f"(00:00 UTC) click Generate Images again — only the missing ones are made. "
-                        f"The video cannot be built until all images exist.")
-                else:
-                    image_bar.progress(1.0)
-                    st.success("All images generated successfully!")
-
-                with open(zip_path, "rb") as f:
-                    st.download_button(
-                        "Download scene_images_batch.zip",
-                        f,
-                        file_name="scene_images_batch.zip",
-                        mime="application/zip",
-                        key="dl_images_tab"
-                        )
+                if start_image_job(active_manifest_path, cloudflare_accounts, style_override):
+                    st.session_state["images_reviewed"] = False
+                    time.sleep(1)
+                    st.rerun()
             except Exception as e:
-                st.error(f"Image generation failed: {e}")
+                st.error(f"Could not start image generation: {e}")
+    if _img_running:
+        st.info("Pictures are being made on the server. Progress is at the top of the page, and you can switch "
+                "tabs or windows freely.")
+    if active_manifest_path and os.path.exists(active_manifest_path):
+        _zip_job = bg_jobs.get_job("images")
+        _zp = ((_zip_job or {}).get("result") or {}).get("zip_path")
+        if _zp and os.path.exists(_zp) and st.checkbox("Show download button for all pictures (zip)", key="show_zip_dl"):
+            with open(_zp, "rb") as f:
+                st.download_button("Download scene_images_batch.zip", f, file_name="scene_images_batch.zip",
+                                   mime="application/zip", key="dl_images_tab")
 
 with tab_review:
     import scene_fixer
@@ -1228,9 +1246,9 @@ with tab_review:
             st.success(f"All {len(_rv_ids)} pictures exist.")
 
         # ---- gallery -----------------------------------------------------
-        _PER = 30
+        _PER = 12
         _pages = max(1, -(-len(_rv_have) // _PER))
-        gc1, gc2, gc3 = st.columns([1, 1, 2])
+        gc1 = gc2 = gc3 = st
         _page = gc1.number_input("Page", min_value=1, max_value=_pages, value=1, step=1, key="rv_page")
         _show_prompts = gc2.checkbox("Show prompts", value=False, key="rv_prompts")
         gc3.caption(f"Page {_page} of {_pages}: scenes "
@@ -1239,9 +1257,9 @@ with tab_review:
                     f"Pictures marked ✎ were redone before.")
         _thumb_dir = os.path.join(os.path.dirname(_rv_dir), "thumbs")
         _chunk = _rv_have[(_page - 1) * _PER: _page * _PER]
-        for _row_start in range(0, len(_chunk), 5):
-            _cols = st.columns(5)
-            for _c, _sid in zip(_cols, _chunk[_row_start:_row_start + 5]):
+        for _row_start in range(0, len(_chunk), 3):
+            _cols = st.columns(3)
+            for _c, _sid in zip(_cols, _chunk[_row_start:_row_start + 3]):
                 with _c:
                     _tp = scene_fixer.make_thumb(os.path.join(_rv_dir, f"scene_{_sid:03d}.png"), _thumb_dir)
                     st.image(_tp, caption=f"Scene {_sid}" + (" ✎" if str(_sid) in _rv_fixes else ""),
@@ -1255,7 +1273,7 @@ with tab_review:
         if _look and _look in _rv_ids:
             _lp = os.path.join(_rv_dir, f"scene_{_look:03d}.png")
             if os.path.exists(_lp):
-                st.image(_lp, caption=f"Scene {_look}", width=640)
+                st.image(_lp, caption=f"Scene {_look}", use_container_width=True)
                 st.caption("Prompt in your manifest: " + _rv_prompts.get(_look, ""))
                 if str(_look) in _rv_fixes:
                     _fx = _rv_fixes[str(_look)]
@@ -1348,7 +1366,7 @@ with tab_review:
         if st.button("✅ Pictures look good: go to the video", key="rv_ok", disabled=bool(_rv_missing)):
             st.session_state["images_reviewed"] = True
         if st.session_state.get("images_reviewed"):
-            st.success("Marked as reviewed. Open the 6. Video tab and press Assemble Video.")
+            st.success("Marked as reviewed. Open the Video tab and press Assemble Video.")
 
 
 with tab_video:
@@ -1381,13 +1399,15 @@ with tab_video:
 
     _reviewed = st.session_state.get("images_reviewed", False)
     if not _reviewed:
-        st.info("Check the pictures in the 5. Review tab first (extra arms, doubled faces), then come back. "
+        st.info("Check the pictures in the Review tab first (extra arms, doubled faces), then come back. "
                 "Already checked them, or want to skip it?")
         _reviewed = st.checkbox("Skip review and build anyway", key="video_skip_review")
 
-    if st.button("Assemble Video", type="primary"):
+    _vid_running = bg_jobs.is_running("video")
+    _img_busy = bg_jobs.is_running("images")
+    if st.button("Assemble Video", type="primary", disabled=_vid_running or _img_busy):
         if not _reviewed:
-            st.error("Review the pictures first (5. Review tab), or tick 'Skip review and build anyway'.")
+            st.error("Review the pictures first (Review tab), or tick 'Skip review and build anyway'.")
         elif not active_manifest_for_video or not images_dir_for_video:
             st.error("Missing scene manifest.")
         elif not active_audio_for_video or not os.path.exists(active_audio_for_video):
@@ -1397,35 +1417,22 @@ with tab_video:
                      f"of {resume_info['total_images']} images are still missing. Finish them in the Images tab "
                      f"(after 05:00 Pakistan time when the quota resets), then assemble.")
         else:
-            try:
-                video_bar = st.progress(0.0)
-                video_status = st.empty()
-                video_log = make_progress_log(video_status)
-
-                def on_video_progress(done_scenes, total_scenes, message):
-                    pct = done_scenes / total_scenes if total_scenes else 0
-                    video_bar.progress(min(pct, 1.0))
-                    video_log(f"{done_scenes}/{total_scenes} scenes — {message}")
-
-                import video_assembler
-                output_video_path = os.path.join(get_session_temp_dir(), "final_video.mp4")
-                final_path, filled_scenes = video_assembler.assemble_video(
-                    active_manifest_for_video, images_dir_for_video, active_audio_for_video,
-                    output_video_path, progress_callback=on_video_progress,
-                )
-                st.session_state["video_path"] = final_path
-                video_bar.progress(1.0)
-
-                if filled_scenes:
-                    st.warning(f"Video assembled and fully in sync — but {len(filled_scenes)} scene(s) didn't "
-                               f"have their own image yet, so a neighboring scene's picture was used to fill "
-                               f"that gap: {filled_scenes}. Regenerate those in the Images tab, then reassemble "
-                               f"to swap in the real artwork.")
-                else:
-                    st.success("Video assembled successfully!")
-
-            except Exception as e:
-                st.error(f"Video assembly failed: {e}")
+            output_video_path = os.path.join(get_session_temp_dir(), "final_video.mp4")
+            _vmeta = {"script_text": st.session_state.get("script_text", ""),
+                      "manifest_path": active_manifest_for_video, "audio_path": active_audio_for_video,
+                      "images_dir": images_dir_for_video}
+            _vj, _vstarted = bg_jobs.start_job(
+                "video", bg_jobs.video_job_target(active_manifest_for_video, images_dir_for_video,
+                                                  active_audio_for_video, output_video_path), _vmeta)
+            if _vstarted:
+                st.session_state.pop("video_path", None)
+                time.sleep(1)
+                st.rerun()
+    if _vid_running:
+        st.info("The video is being built on the server. Progress is at the top of the page; you can switch "
+                "tabs or windows freely.")
+    if _img_busy:
+        st.caption("Wait for the pictures to finish before building the video.")
 
     if st.session_state.get("video_path") and os.path.exists(st.session_state["video_path"]):
         show_video_preview(st.session_state["video_path"], "video_tab")
